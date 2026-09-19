@@ -1,5 +1,6 @@
 streamlit
 nibabel
 numpy
+scipy
 scikit-fuzzy
 plotly
