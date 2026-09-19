@@ -6,27 +6,26 @@ import plotly.express as px
 import tempfile
 import os
 
-# Page configuration
 st.set_page_config(page_title="3D MRI Tumor Segmentation", layout="wide")
 st.title("🧠 Interactive 3D Brain MRI Fuzzy Segmentation")
-st.write("Upload any custom NIfTI MRI scan to test real-time Fuzzy C-Means boundary processing and 3D volume navigation.")
+st.write("Applying Fuzzy C-Means Logic to handle ambiguous tumor boundaries for MS Biomedical Engineering Research.")
 st.markdown("---")
 
-# Main File Uploader for Custom Scans
-uploaded_file = st.file_uploader("Upload Professor's / Custom MRI Scan (.nii or .nii.gz)", type=['nii', 'nii.gz'])
+# Dono options ke liye radio button
+option = st.radio("MRI Scan Source Select Karein:", 
+                  ["Upload Custom .nii/.nii.gz File", "Use Built-in Synthetic Brain Matrix (Instant Test)"])
 
 target_path = None
 
-if uploaded_file is not None:
-    # Save uploaded custom file temporarily
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
-    tmp.write(uploaded_file.read())
-    target_path = tmp.name
+if option == "Upload Custom .nii/.nii.gz File":
+    uploaded_file = st.file_uploader("Apni ya Professor ki MRI File Upload Karein", type=['nii', 'nii.gz'])
+    if uploaded_file is not None:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
+        tmp.write(uploaded_file.read())
+        target_path = tmp.name
 else:
-    st.info("👆 Upar diye gaye uploader se aap koi bhi custom MRI file (jaise BraTS dataset ki file) upload kar sakte hain. Testing ke liye neeche synthetic option bhi check kar sakte hain.")
-    
-    if st.checkbox("Generate Synthetic Brain Matrix (Quick Test Mode)"):
-        with st.spinner("Generating 3D mathematical brain tensor..."):
+    if st.button("Generate Built-in Synthetic Brain Volume"):
+        with st.spinner("3D mathematical brain tensor generate ho raha hai..."):
             shape = (64, 64, 30)
             vol = np.random.normal(0.2, 0.05, shape)
             z, y, x = np.ogrid[:64, :64, :30]
@@ -45,24 +44,23 @@ else:
 
 if target_path and os.path.exists(target_path):
     try:
-        # 1. Load Custom NIfTI Tensor Volume
         mri_image = nib.load(target_path)
         volume_3d = mri_image.get_fdata()
         
-        st.success(f"Custom MRI Successfully Loaded! 3D Tensor Dimensions (X, Y, Z): {volume_3d.shape}")
+        st.success(f"MRI Successfully Loaded! Tensor Dimensions (X, Y, Z): {volume_3d.shape}")
         
-        # 2. Interactive Slice Navigation Slider (Z-Axis Depth)
+        # Interactive slider for slice navigation
         max_slice = volume_3d.shape[2] - 1
         default_slice = max_slice // 2
-        selected_slice_idx = st.slider("🔍 Navigate Through Brain Slices (Z-Axis)", 0, max_slice, default_slice)
+        selected_slice_idx = st.slider("🔍 Brain Slices Navigate Karein (Z-Axis Depth)", 0, max_slice, default_slice)
         
         slice_2d = volume_3d[:, :, selected_slice_idx]
         
-        # Normalize intensity between 0 and 1
+        # Normalize intensity
         slice_norm = (slice_2d - np.min(slice_2d)) / (np.max(slice_2d) - np.min(slice_2d) + 1e-8)
         
-        # 3. Apply Fuzzy C-Means (FCM) Clustering on the selected slice
-        st.info("Applying Mathematical Fuzzy Logic (FCM) Clustering on Non-Binary Boundaries...")
+        # Apply Fuzzy C-Means (FCM)
+        st.info("Applying Mathematical Fuzzy Logic (FCM) on Non-Binary Boundaries...")
         data = slice_norm.reshape(1, -1)
         n_clusters = 3
         
@@ -73,7 +71,6 @@ if target_path and os.path.exists(target_path):
         cluster_idx = np.argmax(cntr)
         segmented_membership = u[cluster_idx].reshape(slice_norm.shape)
         
-        # 4. Display Interactive Side-by-Side Visualizations
         col1, col2 = st.columns(2)
         
         with col1:
@@ -89,7 +86,7 @@ if target_path and os.path.exists(target_path):
             st.plotly_chart(fig2, use_container_width=True)
             
     except Exception as e:
-        st.error(f"An error occurred while processing the custom MRI file: {e}")
+        st.error(f"Processing ke dauran error aaya: {e}")
         
     finally:
         try:
@@ -97,4 +94,4 @@ if target_path and os.path.exists(target_path):
         except:
             pass
 else:
-    st.warning("Please upload a custom NIfTI MRI scan or enable test mode to begin.")
+    st.warning("Pehle upar diye gaye options me se ek select karein.")
