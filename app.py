@@ -5,7 +5,6 @@ import skfuzzy as fuzz
 import plotly.express as px
 import tempfile
 import os
-import urllib.request
 
 # Page setup
 st.set_page_config(page_title="3D MRI Tumor Segmentation", layout="wide")
@@ -13,29 +12,42 @@ st.title("🧠 3D Brain Tumor MRI Segmentation")
 st.write("Applying Fuzzy C-Means Logic to handle ambiguous tumor boundaries for MS Biomedical Engineering Research.")
 st.markdown("---")
 
-# Option to upload or use default sample
-st.subheader("Select MRI Source")
-option = st.radio("Choose how to load the MRI scan:", ["Upload your own .nii/.nii.gz file", "Use Built-in Sample Brain MRI"])
+st.subheader("MRI Scan Source")
+option = st.radio("Choose option:", ["Upload your own .nii/.nii.gz file", "Generate Synthetic 3D Brain Matrix (No Download Needed)"])
 
 target_path = None
-temp_file_obj = None
 
 if option == "Upload your own .nii/.nii.gz file":
     uploaded_file = st.file_uploader("Upload an MRI Scan", type=['nii', 'nii.gz'])
     if uploaded_file is not None:
-        temp_file_obj = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
-        temp_file_obj.write(uploaded_file.read())
-        target_path = temp_file_obj.name
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
+        tmp.write(uploaded_file.read())
+        target_path = tmp.name
 else:
-    if st.button("Load and Process Sample MRI"):
-        with st.spinner("Downloading sample brain MRI from public repository..."):
-            sample_url = "https://raw.githubusercontent.com/miykael/nipype-tutorial/master/notebooks/data/subject1_T1.nii.gz"
-            temp_file_obj = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
-            urllib.request.urlretrieve(sample_url, temp_file_obj.name)
-            target_path = temp_file_obj.name
+    if st.button("Generate & Process Synthetic Brain Volume"):
+        with st.spinner("Generating 3D mathematical brain tensor and tumor simulation..."):
+            # Create synthetic 3D brain volume with a simulated tumor region
+            shape = (64, 64, 30)
+            vol = np.random.normal(0.2, 0.05, shape)
+            z, y, x = np.ogrid[:64, :64, :30]
+            
+            # Brain tissue mask
+            brain_mask = (x - 32)**2 + (y - 32)**2 + (z - 15)**2 < 600
+            vol[brain_mask] += 0.4
+            
+            # Tumor anomaly mask (high intensity region with ambiguous borders)
+            tumor_mask = (x - 40)**2 + (y - 38)**2 + (z - 15)**2 < 80
+            vol[tumor_mask] += 0.7
+            
+            # Save as temporary NIfTI file
+            affine = np.eye(4)
+            nifti_img = nib.Nifti1Image(vol, affine)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
+            nib.save(nifti_img, tmp.name)
+            target_path = tmp.name
 
 if target_path and os.path.exists(target_path):
-    st.success("MRI Scan loaded successfully! Running Fuzzy Processing Engine...")
+    st.success("MRI Matrix loaded successfully! Running Fuzzy Processing Engine...")
     
     try:
         # 1. Load the NIfTI Tensor Matrix
@@ -59,7 +71,7 @@ if target_path and os.path.exists(target_path):
         )
         
         cluster_idx = np.argmax(cntr)
-        segmented_membership = u[cluster_idx].reshape(slice_norm.slice_shape if hasattr(slice_norm, 'slice_shape') else slice_norm.shape)
+        segmented_membership = u[cluster_idx].reshape(slice_norm.shape)
         
         # 4. Display Results Side-by-Side
         col1, col2 = st.columns(2)
@@ -80,11 +92,9 @@ if target_path and os.path.exists(target_path):
         st.error(f"An error occurred during processing: {e}")
         
     finally:
-        if temp_file_obj:
-            temp_file_obj.close()
-            try:
-                os.remove(target_path)
-            except:
-                pass
+        try:
+            os.remove(target_path)
+        except:
+            pass
 else:
-    st.warning("Please select a sample scan or upload a file to begin.")
+    st.warning("Please select an option and click the button to begin.")
