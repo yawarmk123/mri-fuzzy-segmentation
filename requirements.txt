@@ -1,6 +1,8 @@
-
 streamlit
 numpy
 matplotlib
-scikit-fuzzy
 Pillow
+scikit-fuzzy
+nibabel
+scikit-image
+scipy
