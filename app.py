@@ -8,11 +8,12 @@ import nibabel as nib
 # Page Configuration
 st.set_page_config(page_title="Universal Medical AI Engine", layout="wide")
 st.title("🧠 Universal Medical AI: Multi-Format MRI Processor")
-st.write("Aap koi bhi file upload karein (3D NIfTI, Grid Sheet, ya Single 2D Image), yeh engine khud detect karke Fuzzy C-Means segmentation run karega.")
+st.markdown("### MS Biomedical Engineering Research Portfolio Project")
+st.write("An advanced computational pipeline designed to dynamically process 3D NIfTI volumetric scans, multi-slice radiological grid plates, or single 2D frames, applying Fuzzy C-Means (FCM) clustering to resolve ambiguous tumor boundaries.")
 
-# Universal File Uploader accepting both images and medical files
+# Universal File Uploader accepting both medical volumes and image plates
 uploaded_file = st.file_uploader(
-    "Upload MRI File (.nii, .nii.gz, .png, .jpg, .jpeg)", 
+    "Upload Medical Scan File (.nii, .nii.gz, .png, .jpg, .jpeg)", 
     type=['nii', 'nii.gz', 'png', 'jpg', 'jpeg']
 )
 
@@ -28,14 +29,14 @@ if uploaded_file is not None:
             f.write(bytes_data)
         img_nii = nib.load("temp_scan.nii.gz")
         volume_3d = img_nii.get_fdata()
-        st.success(f"3D NIfTI file successfully loaded! Tensor Shape: {volume_3d.shape}")
+        st.success(f"3D NIfTI volumetric tensor successfully loaded! Shape: {volume_3d.shape}")
         
     else:
         # Image file (Grid Sheet or Single 2D Scan)
         grid_img = Image.open(uploaded_file).convert('L')
-        st.image(uploaded_file, caption="Uploaded Image Plate", width=350)
+        st.image(uploaded_file, caption="Uploaded Radiological Image Plate", width=350)
         
-        is_grid = st.checkbox("Kya yeh multiple slices wali Radiological Grid Sheet hai?", value=True)
+        is_grid = st.checkbox("Process as a Multi-Slice Radiological Grid Plate", value=True)
         
         if is_grid:
             col1, col2 = st.columns(2)
@@ -55,20 +56,20 @@ if uploaded_file is not None:
                     tiles.append(np.array(Image.fromarray(tile).resize((64, 64))))
             
             volume_3d = np.stack(tiles, axis=-1)
-            st.success(f"Grid sheet successfully chopped into {len(tiles)} slices! Tensor Shape: {volume_3d.shape}")
+            st.success(f"Grid sheet successfully parsed into {len(tiles)} spatial slices! Reconstructed Tensor Shape: {volume_3d.shape}")
         else:
             arr = np.array(grid_img.resize((128, 128)))
             volume_3d = np.stack([arr] * 5, axis=-1)
-            st.success("Single 2D image successfully converted to volumetric stack.")
+            st.success("Single 2D frame successfully converted to volumetric tensor stack.")
 
 # --- COMMON PROCESSING & FUZZY SEGMENTATION ENGINE ---
 if volume_3d is not None:
     st.markdown("---")
-    st.subheader("🔬 Volumetric Slice Navigator & Fuzzy Segmentation")
+    st.subheader("🔬 Volumetric Slice Navigator & Fuzzy Segmentation Engine")
     
     if len(volume_3d.shape) == 3:
         max_z = volume_3d.shape[2] - 1
-        z_idx = st.slider("Navigate Through Z-Axis Slices", 0, max_z, max_z // 2)
+        z_idx = st.slider("Navigate Through Z-Axis Hyper-Plane Slices", 0, max_z, max_z // 2)
         current_slice = volume_3d[:, :, z_idx]
     else:
         current_slice = volume_3d
@@ -77,14 +78,14 @@ if volume_3d is not None:
     col_a, col_b = st.columns(2)
     
     with col_a:
-        st.write(f"**Active Slice Frame (Index: {z_idx})**")
+        st.write(f"**Original Brain Slice (Frame Index: {z_idx})**")
         fig1, ax1 = plt.subplots()
         ax1.imshow(current_slice, cmap='gray')
         ax1.axis('off')
         st.pyplot(fig1)
         
     with col_b:
-        st.write("**Fuzzy C-Means Segmentation (False-Color Map)**")
+        st.write("**Fuzzy C-Means Segmentation (False-Color Membership Map)**")
         
         flat = current_slice.flatten().astype(float)
         norm = (flat - np.min(flat)) / (np.max(flat) - np.min(flat) + 1e-8)
@@ -105,6 +106,6 @@ if volume_3d is not None:
         st.pyplot(fig2)
         
     st.markdown("---")
-    st.info("💡 **Research Note:** The system dynamically processes multi-format medical inputs, resolving ambiguous boundaries and overlapping intensity levels via Fuzzy C-Means clustering.")
+    st.info("💡 **Academic Research Note:** By converting 2D plates into spatial 3D tensors and executing Fuzzy C-Means clustering, this system successfully overcomes partial volume effects and boundary ambiguity inherent in medical imaging.")
 else:
-    st.warning("👈 Please koi bhi MRI file (Grid image ya NIfTI) upload karein taaki AI engine run ho sake.")
+    st.warning("👈 Please upload a medical scan file or radiological image plate using the uploader above to initialize the AI pipeline.")
