@@ -1,6 +1,6 @@
+
 streamlit
-nibabel
 numpy
-scipy
+matplotlib
 scikit-fuzzy
-plotly
+Pillow
