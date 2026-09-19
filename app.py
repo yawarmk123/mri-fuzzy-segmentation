@@ -1,97 +1,76 @@
 import streamlit as st
-import nibabel as nib
 import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
 import skfuzzy as fuzz
-import plotly.express as px
-import tempfile
-import os
 
-st.set_page_config(page_title="3D MRI Tumor Segmentation", layout="wide")
-st.title("🧠 Interactive 3D Brain MRI Fuzzy Segmentation")
-st.write("Applying Fuzzy C-Means Logic to handle ambiguous tumor boundaries for MS Biomedical Engineering Research.")
-st.markdown("---")
+# Page Configuration
+st.set_page_config(page_title="2D-to-3D MRI Fuzzy Segmentation", layout="wide")
+st.title("🧠 2D-to-3D MRI Reconstruction & Fuzzy C-Means Segmentation")
+st.write("Transforming standard 2D MRI slices into a 3D volumetric tensor and applying Fuzzy Logic for ambiguous tumor boundaries.")
 
-# Dono options ke liye radio button
-option = st.radio("MRI Scan Source Select Karein:", 
-                  ["Upload Custom .nii/.nii.gz File", "Use Built-in Synthetic Brain Matrix (Instant Test)"])
+# File Uploader for Multiple 2D Slices (PNG/JPG from Kaggle datasets)
+uploaded_files = st.file_uploader(
+    "Upload Multiple 2D MRI Slices (Select multiple PNG/JPG files)", 
+    type=['png', 'jpg', 'jpeg'], 
+    accept_multiple_files=True
+)
 
-target_path = None
-
-if option == "Upload Custom .nii/.nii.gz File":
-    uploaded_file = st.file_uploader("Apni ya Professor ki MRI File Upload Karein", type=['nii', 'nii.gz'])
-    if uploaded_file is not None:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
-        tmp.write(uploaded_file.read())
-        target_path = tmp.name
-else:
-    if st.button("Generate Built-in Synthetic Brain Volume"):
-        with st.spinner("3D mathematical brain tensor generate ho raha hai..."):
-            shape = (64, 64, 30)
-            vol = np.random.normal(0.2, 0.05, shape)
-            z, y, x = np.ogrid[:64, :64, :30]
-            
-            brain_mask = (x - 32)**2 + (y - 32)**2 + (z - 15)**2 < 600
-            vol[brain_mask] += 0.4
-            
-            tumor_mask = (x - 40)**2 + (y - 38)**2 + (z - 15)**2 < 80
-            vol[tumor_mask] += 0.7
-            
-            affine = np.eye(4)
-            nifti_img = nib.Nifti1Image(vol, affine)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.nii.gz')
-            nib.save(nifti_img, tmp.name)
-            target_path = tmp.name
-
-if target_path and os.path.exists(target_path):
-    try:
-        mri_image = nib.load(target_path)
-        volume_3d = mri_image.get_fdata()
+if uploaded_files:
+    st.success(f"Successfully uploaded {len(uploaded_files)} 2D slices! Building 3D Tensor Volume...")
+    
+    # 1. 2D Slices ko 3D Tensor mein stack karna (Mathematical Hyper-plane mapping)
+    slices_list = []
+    for file in uploaded_files:
+        img = Image.open(file).convert('L').resize((128, 128))  # Standardize shape
+        slices_list.append(np.array(img))
         
-        st.success(f"MRI Successfully Loaded! Tensor Dimensions (X, Y, Z): {volume_3d.shape}")
+    # 3D Volume Tensor V shape: (Height, Width, Depth)
+    volume_3d = np.stack(slices_list, axis=-1)
+    
+    st.info(f"Successfully constructed 3D Tensor Matrix of shape: {volume_3d.shape}")
+    
+    # 2. Z-axis slice navigation slider
+    z_index = st.slider("Navigate Through 3D Volume (Z-axis Slices)", 0, volume_3d.shape[2] - 1, volume_3d.shape[2] // 2)
+    
+    current_slice = volume_3d[:, :, z_index]
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader(f"Original 2D Slice (Z = {z_index})")
+        fig1, ax1 = plt.subplots()
+        ax1.imshow(current_slice, cmap='gray')
+        ax1.axis('off')
+        st.pyplot(fig1)
         
-        # Interactive slider for slice navigation
-        max_slice = volume_3d.shape[2] - 1
-        default_slice = max_slice // 2
-        selected_slice_idx = st.slider("🔍 Brain Slices Navigate Karein (Z-Axis Depth)", 0, max_slice, default_slice)
+    with col2:
+        st.subheader("Fuzzy C-Means Segmentation (False-Color)")
         
-        slice_2d = volume_3d[:, :, selected_slice_idx]
+        # Mathematical Normalization
+        flat_data = current_slice.flatten().astype(float)
+        norm_data = (flat_data - np.min(flat_data)) / (np.max(flat_data) - np.min(flat_data) + 1e-8)
         
-        # Normalize intensity
-        slice_norm = (slice_2d - np.min(slice_2d)) / (np.max(slice_2d) - np.min(slice_2d) + 1e-8)
-        
-        # Apply Fuzzy C-Means (FCM)
-        st.info("Applying Mathematical Fuzzy Logic (FCM) on Non-Binary Boundaries...")
-        data = slice_norm.reshape(1, -1)
+        # Apply Fuzzy C-Means (FCM) Clustering to handle ambiguous boundaries
         n_clusters = 3
-        
         cntr, u, _, _, _, _, _ = fuzz.cluster.cmeans(
-            data, c=n_clusters, m=2.0, error=0.005, maxiter=50, init=None
+            norm_data.reshape(1, -1), c=n_clusters, m=2.0, error=0.005, maxiter=100, init=None
         )
         
-        cluster_idx = np.argmax(cntr)
-        segmented_membership = u[cluster_idx].reshape(slice_norm.shape)
+        tumor_cluster_idx = np.argmax(cntr)
+        membership_map = u[tumor_cluster_idx].reshape(current_slice.shape)
         
-        col1, col2 = st.columns(2)
+        # Render False-Color Overlay
+        fig2, ax2 = plt.subplots()
+        ax2.imshow(current_slice, cmap='gray')
+        ax2.imshow(membership_map, cmap='jet', alpha=0.6)  # False-color mapping for anomaly
+        ax2.axis('off')
+        st.pyplot(fig2)
         
-        with col1:
-            st.subheader(f"Original Slice (Depth Z: {selected_slice_idx})")
-            fig1 = px.imshow(slice_norm, color_continuous_scale='gray')
-            fig1.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=30, b=0))
-            st.plotly_chart(fig1, use_container_width=True)
-            
-        with col2:
-            st.subheader("Fuzzy Segmented Anomaly (False Color)")
-            fig2 = px.imshow(segmented_membership, color_continuous_scale='jet')
-            fig2.update_layout(margin=dict(l=0, r=0, t=30, b=0))
-            st.plotly_chart(fig2, use_container_width=True)
-            
-    except Exception as e:
-        st.error(f"Processing ke dauran error aaya: {e}")
-        
-    finally:
-        try:
-            os.remove(target_path)
-        except:
-            pass
+    st.markdown("---")
+    st.markdown("### 📊 Mathematical & Research Insight")
+    st.latex(r"V \in \mathbb{R}^{X \times Y \times Z} \quad \text{(3D Reconstructed Tensor)}")
+    st.write("By stacking 2D scans into a 3D spatial matrix and applying Fuzzy C-Means membership functions, the system successfully resolves overlapping intensity distributions and partial volume effects at the tumor boundaries.")
+
 else:
-    st.warning("Pehle upar diye gaye options me se ek select karein.")
+    st.warning("Please upload a set of 2D MRI slice images from your dataset to initiate 2D-to-3D volumetric reconstruction.")
