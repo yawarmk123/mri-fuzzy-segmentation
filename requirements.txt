@@ -6,3 +6,4 @@ scikit-fuzzy
 nibabel
 scikit-image
 scipy
+requests
