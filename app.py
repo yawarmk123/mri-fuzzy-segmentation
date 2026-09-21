@@ -104,11 +104,14 @@ if volume_3d is not None:
         z_idx = 0
 
     col_a, col_b = st.columns(2)
+
+      col_a, col_b = st.columns(2)
     
     with col_a:
         st.write(f"**Original Brain Slice (Frame Index: {z_idx})**")
         fig1, ax1 = plt.subplots()
-        ax1.imshow(current_slice, cmap='gray')
+        # Yahan interpolation='bicubic' add kiya gaya hai image ko smooth karne ke liye
+        ax1.imshow(current_slice, cmap='gray', interpolation='bicubic')
         ax1.axis('off')
         st.pyplot(fig1)
         
@@ -117,6 +120,28 @@ if volume_3d is not None:
         flat = current_slice.flatten().astype(float)
         norm = (flat - np.min(flat)) / (np.max(flat) - np.min(flat) + 1e-8)
         
+        try:
+            cntr, u, _, _, _, _, _ = fuzz.cluster.cmeans(
+                norm.reshape(1, -1), c=3, m=2.0, error=0.005, maxiter=50, init=None
+            )
+            tumor_idx = np.argmax(cntr)
+            membership = u[tumor_idx].reshape(current_slice.shape)
+            
+            anomaly_pixels = np.sum(membership > 0.6)
+            total_brain_pixels = np.sum(norm > 0.1) 
+            if total_brain_pixels == 0: total_brain_pixels = 1
+            anomaly_percentage = (anomaly_pixels / total_brain_pixels) * 100
+        except Exception:
+            membership = np.random.rand(*current_slice.shape)
+            anomaly_percentage = 0.0
+            
+        fig2, ax2 = plt.subplots()
+        # Yahan dono images (background aur tumor map) par bicubic smoothing laga di gayi hai
+        ax2.imshow(current_slice, cmap='gray', interpolation='bicubic')
+        ax2.imshow(membership, cmap='jet', alpha=0.55, interpolation='bicubic')
+        ax2.axis('off')
+        st.pyplot(fig2)
+      
         try:
             cntr, u, _, _, _, _, _ = fuzz.cluster.cmeans(
                 norm.reshape(1, -1), c=3, m=2.0, error=0.005, maxiter=50, init=None
