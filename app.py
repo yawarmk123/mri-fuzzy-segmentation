@@ -11,8 +11,9 @@ import os
 st.set_page_config(page_title="Universal Medical AI Engine", layout="wide")
 
 # --- CLINICAL DASHBOARD HEADER ---
-st.markdown("<h1 style='text-align: center; color: #2E4053;'>🧠 Advanced Medical AI Diagnostic Engine</h1>", unsafe_allow_html=True)
-st.markdown("<h4 style='text-align: center; color: #5D6D7E;'>Mathematical 3D MRI Segmentation via Gaussian-Smoothed FCM</h4>", unsafe_allow_html=True)
+# Bade text ko chota aur professional kiya gaya hai
+st.markdown("### 🧠 Advanced Medical AI Diagnostic Engine")
+st.markdown("##### Mathematical 3D MRI Segmentation via Gaussian-Smoothed FCM")
 st.info("👨‍⚕️ **Reviewer / Professor Note:** This live dashboard demonstrates the application of mathematical clustering (Fuzzy Logic) to resolve ambiguous medical data boundaries.")
 st.markdown("---")
 
@@ -31,8 +32,8 @@ st.markdown("---")
 volume_3d = None
 anomaly_percentage = 0.0
 
-# --- DATA SOURCE SELECTION (Old Feature Brought Back) ---
-st.subheader("Select MRI Data Source")
+# --- DATA SOURCE SELECTION ---
+st.markdown("#### Select MRI Data Source")
 data_option = st.radio("Choose how to load the MRI scan:", 
                        ["Use Demo Clinical Record (Auto-Generate 3D Scan)", "Upload Patient MRI Scan"])
 
@@ -93,7 +94,7 @@ else:
 # --- COMMON PROCESSING & FUZZY SEGMENTATION ENGINE ---
 if volume_3d is not None:
     st.markdown("---")
-    st.subheader("🔬 Volumetric Slice Navigator & Fuzzy Segmentation Engine")
+    st.markdown("#### 🔬 Volumetric Slice Navigator & Fuzzy Segmentation Engine")
     
     if len(volume_3d.shape) == 3:
         max_z = volume_3d.shape[2] - 1
@@ -104,13 +105,10 @@ if volume_3d is not None:
         z_idx = 0
 
     col_a, col_b = st.columns(2)
-
-      col_a, col_b = st.columns(2)
     
     with col_a:
         st.write(f"**Original Brain Slice (Frame Index: {z_idx})**")
         fig1, ax1 = plt.subplots()
-        # Yahan interpolation='bicubic' add kiya gaya hai image ko smooth karne ke liye
         ax1.imshow(current_slice, cmap='gray', interpolation='bicubic')
         ax1.axis('off')
         st.pyplot(fig1)
@@ -136,36 +134,14 @@ if volume_3d is not None:
             anomaly_percentage = 0.0
             
         fig2, ax2 = plt.subplots()
-        # Yahan dono images (background aur tumor map) par bicubic smoothing laga di gayi hai
         ax2.imshow(current_slice, cmap='gray', interpolation='bicubic')
         ax2.imshow(membership, cmap='jet', alpha=0.55, interpolation='bicubic')
-        ax2.axis('off')
-        st.pyplot(fig2)
-      
-        try:
-            cntr, u, _, _, _, _, _ = fuzz.cluster.cmeans(
-                norm.reshape(1, -1), c=3, m=2.0, error=0.005, maxiter=50, init=None
-            )
-            tumor_idx = np.argmax(cntr)
-            membership = u[tumor_idx].reshape(current_slice.shape)
-            
-            anomaly_pixels = np.sum(membership > 0.6)
-            total_brain_pixels = np.sum(norm > 0.1) 
-            if total_brain_pixels == 0: total_brain_pixels = 1
-            anomaly_percentage = (anomaly_pixels / total_brain_pixels) * 100
-        except Exception:
-            membership = np.random.rand(*current_slice.shape)
-            anomaly_percentage = 0.0
-            
-        fig2, ax2 = plt.subplots()
-        ax2.imshow(current_slice, cmap='gray')
-        ax2.imshow(membership, cmap='jet', alpha=0.55)
         ax2.axis('off')
         st.pyplot(fig2)
         
     # --- CLINICAL DIAGNOSTIC REPORT ---
     st.markdown("---")
-    st.markdown("## 📋 Automated Clinical Diagnostic Report")
+    st.markdown("#### 📋 Automated Clinical Diagnostic Report")
     st.caption("AI-Generated Insights based on Fuzzy Segmentation Extent")
     
     estimated_volume_cc = round(anomaly_percentage * 4.5, 2)
