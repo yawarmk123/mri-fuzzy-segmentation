@@ -196,3 +196,47 @@ if volume_3d is not None:
         st.warning("⚕️ **Clinical Recommendations:**\n"
                    "- **Surgical:** Biopsy or Stereotactic Radiosurgery.\n"
                    "- **Next Steps:** Full 3D contrast-enhanced MRI scan.")
+    # --- AI DIAGNOSTIC ANALYSIS GENERATOR (NEW FEATURE) ---
+    def generate_ai_analysis(anomaly_pct, fpc, volume_cc):
+        if anomaly_pct > 30.0:
+            return f"""**🚨 AI Pathology Analysis: Severe Anomaly Detected**
+- **Kya Masla Hai (Issue Description):** Brain tissue mein ek bohot bada (massive) abnormal cluster detect hua hai jiska volume takriban {volume_cc} cm³ hai. 
+- **Kaisa Masla Hai (Clinical Nature):** Yeh high-grade lesion (jaise Glioblastoma) ya bohot zyada swelling (Edema) ki alamat ho sakti hai. FCM algorithm ka score ({fpc:.4f}) batata hai ke is tumor ki boundaries ajeeb hain aur healthy tissue ke sath mix ho rahi hain. Iski wajah se aas-paas ke healthy dimaagh par pressure (mass effect) parh raha hoga. Foran neurosurgical intervention ki zaroorat hai."""
+            
+        elif anomaly_pct > 10.0:
+            return f"""**⚠️ AI Pathology Analysis: Moderate Focal Lesion**
+- **Kya Masla Hai (Issue Description):** Brain ke is hissay mein darmiyanay size ka ({volume_cc} cm³) abnormal tissue detect hua hai.
+- **Kaisa Masla Hai (Clinical Nature):** Yeh kisi localized tumor (jaise Meningioma ya Low-grade Glioma) ki shuruaat ho sakti hai. Is area ke pixels ki density normal brain matter se mukhtalif hai. FCM Score ({fpc:.4f}) show karta hai ke tumor abhi shuruati stage mein hai aur ek jagah jama hua hai. Doctor ko biopsy ya regular monitoring ka mashwara dena chahiye."""
+            
+        elif anomaly_pct > 2.0:
+            return f"""**🔍 AI Pathology Analysis: Mild / Micro Anomaly**
+- **Kya Masla Hai (Issue Description):** Ek bohot chota ({volume_cc} cm³) abnormal spot detect hua hai jo aam ankh se dekhna mushkil hai.
+- **Kaisa Masla Hai (Clinical Nature):** Yeh micro-lesion, chot (trauma), ya sirf scan ka artifact (machine noise) bhi ho sakta hai. Kyunke Fuzzy logic ne isay detect kiya hai, yeh early-stage pathology ho sakti hai. Isay confirm karne ke liye mazeed high-resolution scans ki zaroorat hai."""
+            
+        else:
+            return f"""**✅ AI Pathology Analysis: Normal / Clean**
+- **Kya Masla Hai (Issue Description):** Koi khas masla detect nahi hua. Anomaly volume bohot kam ({volume_cc} cm³) hai.
+- **Kaisa Masla Hai (Clinical Nature):** Jo minor pixels highlight hue hain woh shayad normal blood vessels ya MRI machine ke magnetic noise ki wajah se hain. Brain tissue ka structure bilkul healthy aur normal lag raha hai."""
+
+    # --- GRADUATE-LEVEL CLINICAL DIAGNOSTIC REPORT ---
+    st.markdown("---")
+    st.markdown("#### 📋 AI-Automated Clinical Diagnostic Report")
+    
+    estimated_volume_cc = round(anomaly_percentage * 4.5, 2)
+    ai_detailed_report = generate_ai_analysis(anomaly_percentage, fpc_score, estimated_volume_cc)
+    
+    # AI Report ko ek khubsurat box mein show karein
+    st.info(ai_detailed_report)
+
+    col_report1, col_report2 = st.columns(2)
+    
+    with col_report1:
+        st.success("📐 **Mathematical Validation:**\n"
+                   f"- **Fuzzy Partition Coefficient (FPC):** `{fpc_score:.4f}`\n"
+                   f"- **Anomaly Extent:** `{anomaly_percentage:.2f}%` of brain region\n"
+                   f"- **Tensor Shape Reconstructed:** `{volume_3d.shape}`")
+
+    with col_report2:
+        st.warning("⚕️ **Clinical Recommendations:**\n"
+                   "- **Surgical:** Biopsy or Stereotactic Radiosurgery.\n"
+                   "- **Next Steps:** Full 3D contrast-enhanced MRI scan.")
