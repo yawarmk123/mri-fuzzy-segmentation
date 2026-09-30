@@ -28,6 +28,9 @@ p.sub { color: #55636F; margin: 0 0 1.2rem 0; }
 .kpi.warn { border-left-color: #C77700; } .kpi.high { border-left-color: #B3261E; }
 .notice { background: #FFF6E5; border: 1px solid #F0D9A8; border-radius: 6px;
           padding: .7rem 1rem; color: #5C4200; font-size: .9rem; }
+div[data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: .6rem; }
+div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 44%; }
+.kpi .v { font-size: 1.35rem; }
 section[data-testid="stSidebar"] { background: #F3F6F8; }
 </style>
 """,
@@ -41,14 +44,14 @@ def kpi(label, value, tone=""):
 
 
 # ---------------------------------------------------------------- data loading
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def load_nifti(data: bytes):
     with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
         f.write(data)
         path = f.name
     try:
         img = nib.load(path)
-        vol = np.asarray(img.get_fdata(), dtype=np.float32)
+        vol = np.asarray(img.get_fdata(dtype=np.float32))
         spacing = tuple(float(z) for z in img.header.get_zooms()[:3])
     finally:
         os.remove(path)
@@ -66,24 +69,30 @@ def make_demo():
 
 
 # ---------------------------------------------------------------- segmentation
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def segment(vol, clusters, fuzz_m, bg_thr, seed=0):
-    """Masked FCM: fit centres on a brain-voxel sample, predict membership for the full volume."""
-    lo, hi = np.percentile(vol, [1, 99.5])
-    norm = np.clip((vol - lo) / (hi - lo + 1e-8), 0, 1)
+    """Masked FCM: fit centres on a brain-voxel sample, predict membership in chunks (low memory)."""
+    lo, hi = np.percentile(vol[::2, ::2], [1, 99.5])
+    norm = np.clip((vol - lo) / (hi - lo + 1e-8), 0, 1).astype(np.float16)
     brain = norm > bg_thr
-    vox = norm[brain]
+    vox = norm[brain].astype(np.float32)
     if vox.size < clusters * 10:
         return None
     rng = np.random.default_rng(seed)
     sample = vox if vox.size <= 30000 else rng.choice(vox, 30000, replace=False)
-    cntr, *_ = fuzz.cluster.cmeans(sample.reshape(1, -1), clusters, fuzz_m, error=0.005, maxiter=100)
-    u, *_ = fuzz.cluster.cmeans_predict(vox.reshape(1, -1), cntr, fuzz_m, error=0.005, maxiter=100)
+    cntr, *_ = fuzz.cluster.cmeans(sample.astype(float).reshape(1, -1), clusters, fuzz_m, error=0.005, maxiter=100)
     tumor = int(np.argmax(cntr))
+    out = np.empty(vox.size, dtype=np.float32)
+    fpc_sum = 0.0
+    for i in range(0, vox.size, 200_000):
+        chunk = vox[i:i + 200_000].astype(float).reshape(1, -1)
+        u, *_ = fuzz.cluster.cmeans_predict(chunk, cntr, fuzz_m, error=0.005, maxiter=100)
+        out[i:i + 200_000] = u[tumor]
+        fpc_sum += float(np.sum(u ** 2))
     membership = np.zeros(vol.shape, dtype=np.float32)
-    membership[brain] = u[tumor]
-    fpc = float(np.mean(np.sum(u ** 2, axis=0)))
-    return dict(norm=norm, brain=brain, membership=membership, fpc=fpc, centres=np.sort(cntr.ravel()))
+    membership[brain] = out
+    return dict(norm=norm, brain=brain, membership=membership, fpc=fpc_sum / vox.size,
+                centres=np.sort(cntr.ravel()))
 
 
 def dice_iou(pred, gt):
@@ -153,6 +162,13 @@ if vol is None:
     st.info("Choose a scan in the sidebar to begin. The demo case needs no upload.")
     st.stop()
 
+if vol.size > 12_000_000:  # keeps memory inside free-hosting limits
+    vol = np.ascontiguousarray(vol[::2, ::2, :])
+    spacing = (spacing[0] * 2, spacing[1] * 2, spacing[2])
+    if gt is not None:
+        gt = np.ascontiguousarray(gt[::2, ::2, :])
+    st.caption("Large scan: in-plane resolution was halved to fit hosting memory.")
+
 with st.spinner("Running masked FCM on the full volume..."):
     res = segment(vol, clusters, fuzz_m, bg_thr)
 if res is None:
@@ -185,11 +201,11 @@ with tab_view:
     with c1:
         st.caption(f"Original, slice {z}")
         f1 = slice_figure(res["norm"][:, :, z])
-        st.pyplot(f1, use_container_width=True)
+        st.pyplot(f1, width="stretch")
     with c2:
         st.caption(f"Masked FCM overlay, slice {z}")
         f2 = slice_figure(res["norm"][:, :, z], mem[:, :, z], thr)
-        st.pyplot(f2, use_container_width=True)
+        st.pyplot(f2, width="stretch")
         buf = io.BytesIO()
         f2.savefig(buf, format="png", dpi=200, facecolor="black", bbox_inches="tight", pad_inches=0)
         st.download_button("Download overlay (PNG)", buf.getvalue(), f"fcm_overlay_slice_{z}.png", "image/png")
