@@ -1,242 +1,236 @@
-import streamlit as st
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-import skfuzzy as fuzz
-import nibabel as nib
 import io
+import os
+import tempfile
 
-# Page Configuration
-st.set_page_config(page_title="Universal Medical AI Engine", layout="wide")
+import matplotlib.pyplot as plt
+import nibabel as nib
+import numpy as np
+import skfuzzy as fuzz
+import streamlit as st
+from PIL import Image
 
-# --- CLINICAL DASHBOARD HEADER ---
-st.markdown("### 🧠 Advanced Medical AI Diagnostic Engine")
-st.markdown("##### Mathematical 3D MRI Segmentation via Masked Fuzzy C-Means (FCM)")
-st.info("👨‍⚕️ **Reviewer / Professor Note:** This dashboard utilizes Skull-Stripping and Fuzzy Partition Coefficient (FPC) to validate ambiguous medical boundaries with high mathematical precision.")
-st.markdown("---")
+st.set_page_config(page_title="Neuro Segmentation Workbench", page_icon="🧠", layout="wide")
 
-volume_3d = None
-anomaly_percentage = 0.0
-fpc_score = 0.0
-ground_truth_mask = None # For calculating Dice/IoU if available
+# ---------------------------------------------------------------- styling
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap');
+html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
+footer, #MainMenu { visibility: hidden; }
+.block-container { padding-top: 2rem; max-width: 1280px; }
+h1.title { font-family: 'IBM Plex Serif', serif; font-size: 2rem; margin: 0 0 .2rem 0; color: #14202B; }
+p.sub { color: #55636F; margin: 0 0 1.2rem 0; }
+.kpi { background: #fff; border: 1px solid #D9E0E6; border-left: 4px solid #0E7C86;
+       border-radius: 6px; padding: .8rem 1rem; }
+.kpi .v { font-size: 1.6rem; font-weight: 600; color: #14202B; line-height: 1.2; }
+.kpi .l { font-size: .82rem; color: #55636F; }
+.kpi.warn { border-left-color: #C77700; } .kpi.high { border-left-color: #B3261E; }
+.notice { background: #FFF6E5; border: 1px solid #F0D9A8; border-radius: 6px;
+          padding: .7rem 1rem; color: #5C4200; font-size: .9rem; }
+section[data-testid="stSidebar"] { background: #F3F6F8; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# --- DATA SOURCE SELECTION ---
-st.markdown("#### Select MRI Data Source")
-data_option = st.radio("Choose how to load the MRI scan:", 
-                       ["Upload BraTS NIfTI Scan (.nii.gz)", "Upload Patient Image (.png, .jpg)", "Use Demo Clinical Record"])
 
-if data_option == "Use Demo Clinical Record":
-    if st.button("Load Demo Patient Data"):
-        with st.spinner("Generating 3D mathematical brain tensor and tumor simulation..."):
-            shape = (64, 64, 30)
-            vol = np.random.normal(0.2, 0.05, shape)
-            z, y, x = np.ogrid[:64, :64, :30]
-            brain_mask_sim = (x - 32)**2 + (y - 32)**2 + (z - 15)**2 < 600
-            vol[brain_mask_sim] += 0.4
-            
-            # Simulated Ground Truth for Evaluation
-            tumor_mask_sim = (x - 40)**2 + (y - 38)**2 + (z - 15)**2 < 80
-            vol[tumor_mask_sim] += 0.7
-            
-            volume_3d = vol
-            ground_truth_mask = tumor_mask_sim.astype(np.uint8)
-            st.success("Demo Clinical Record successfully loaded! Tensor Shape: (64, 64, 30)")
+def kpi(label, value, tone=""):
+    st.markdown(f'<div class="kpi {tone}"><div class="v">{value}</div><div class="l">{label}</div></div>',
+                unsafe_allow_html=True)
 
-elif data_option == "Upload BraTS NIfTI Scan (.nii.gz)":
-    uploaded_file = st.file_uploader("Upload BraTS Volume (e.g., FLAIR/T2 .nii.gz)", type=['nii', 'nii.gz'])
-    if uploaded_file is not None:
-        bytes_data = uploaded_file.read()
-        with open("temp_scan.nii.gz", "wb") as f:
-            f.write(bytes_data)
-        img_nii = nib.load("temp_scan.nii.gz")
-        volume_3d = img_nii.get_fdata()
-        st.success(f"3D BraTS NIfTI tensor loaded! Shape: {volume_3d.shape}")
-        st.caption("Note: To calculate precise Dice/IoU, a separate ground truth file would be needed. Currently evaluating algorithm clustering logic.")
 
+# ---------------------------------------------------------------- data loading
+@st.cache_data(show_spinner=False)
+def load_nifti(data: bytes):
+    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
+        f.write(data)
+        path = f.name
+    try:
+        img = nib.load(path)
+        vol = np.asarray(img.get_fdata(), dtype=np.float32)
+        spacing = tuple(float(z) for z in img.header.get_zooms()[:3])
+    finally:
+        os.remove(path)
+    return vol, spacing
+
+
+def make_demo():
+    rng = np.random.default_rng(0)
+    vol = rng.normal(0.2, 0.05, (64, 64, 30)).astype(np.float32)
+    x, y, z = np.ogrid[:64, :64, :30]
+    vol[(x - 32) ** 2 + (y - 32) ** 2 + ((z - 15) * 2) ** 2 < 600] += 0.4
+    gt = (x - 40) ** 2 + (y - 38) ** 2 + ((z - 15) * 2) ** 2 < 80
+    vol[gt] += 0.7
+    return vol, gt.astype(np.uint8), (1.0, 1.0, 1.0)
+
+
+# ---------------------------------------------------------------- segmentation
+@st.cache_data(show_spinner=False)
+def segment(vol, clusters, fuzz_m, bg_thr, seed=0):
+    """Masked FCM: fit centres on a brain-voxel sample, predict membership for the full volume."""
+    lo, hi = np.percentile(vol, [1, 99.5])
+    norm = np.clip((vol - lo) / (hi - lo + 1e-8), 0, 1)
+    brain = norm > bg_thr
+    vox = norm[brain]
+    if vox.size < clusters * 10:
+        return None
+    rng = np.random.default_rng(seed)
+    sample = vox if vox.size <= 30000 else rng.choice(vox, 30000, replace=False)
+    cntr, *_ = fuzz.cluster.cmeans(sample.reshape(1, -1), clusters, fuzz_m, error=0.005, maxiter=100)
+    u, *_ = fuzz.cluster.cmeans_predict(vox.reshape(1, -1), cntr, fuzz_m, error=0.005, maxiter=100)
+    tumor = int(np.argmax(cntr))
+    membership = np.zeros(vol.shape, dtype=np.float32)
+    membership[brain] = u[tumor]
+    fpc = float(np.mean(np.sum(u ** 2, axis=0)))
+    return dict(norm=norm, brain=brain, membership=membership, fpc=fpc, centres=np.sort(cntr.ravel()))
+
+
+def dice_iou(pred, gt):
+    inter = float(np.sum(pred & gt))
+    p, g = float(pred.sum()), float(gt.sum())
+    if p + g == 0:
+        return 1.0, 1.0
+    return 2 * inter / (p + g), inter / (p + g - inter)
+
+
+def slice_figure(img, overlay=None, thr=0.6):
+    fig, ax = plt.subplots(figsize=(5, 5), facecolor="black")
+    ax.imshow(img.T, cmap="gray", origin="lower")
+    if overlay is not None:
+        m = overlay.T >= thr
+        ax.imshow(np.ma.masked_where(~m, overlay.T), cmap="autumn", alpha=0.45, origin="lower", vmin=thr, vmax=1)
+        if m.any():
+            ax.contour(m.astype(float), levels=[0.5], colors="#FF4D4D", linewidths=1.1, origin="lower")
+    ax.axis("off")
+    fig.subplots_adjust(0, 0, 1, 1)
+    return fig
+
+
+# ---------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.markdown("### Scan input")
+    source = st.radio("Source", ["Demo case", "BraTS NIfTI (.nii / .nii.gz)", "2D image (.png / .jpg)"],
+                      label_visibility="collapsed")
+    st.markdown("### Segmentation settings")
+    clusters = st.slider("Clusters (c)", 2, 6, 4)
+    fuzz_m = st.slider("Fuzziness (m)", 1.2, 3.0, 2.0, 0.1)
+    bg_thr = st.slider("Background cut-off", 0.02, 0.4, 0.12, 0.01,
+                       help="Voxels below this normalised intensity are excluded as background / skull region.")
+    thr = st.slider("Tumour membership threshold", 0.3, 0.95, 0.6, 0.05)
+
+vol, gt, spacing, name = None, None, (1.0, 1.0, 1.0), ""
+
+if source == "Demo case":
+    vol, gt, spacing = make_demo()
+    name = "Synthetic demo"
+elif source.startswith("BraTS"):
+    up = st.sidebar.file_uploader("Scan volume", type=["nii", "gz"])
+    up_gt = st.sidebar.file_uploader("Ground-truth mask (optional)", type=["nii", "gz"])
+    if up:
+        vol, spacing = load_nifti(up.getvalue())
+        name = up.name
+        if up_gt:
+            gt = (load_nifti(up_gt.getvalue())[0] > 0).astype(np.uint8)
+            if gt.shape != vol.shape:
+                st.sidebar.error(f"Mask shape {gt.shape} does not match scan {vol.shape}.")
+                gt = None
 else:
-    # Universal File Uploader for Images
-    uploaded_file = st.file_uploader("Upload Medical Scan Image (.png, .jpg)", type=['png', 'jpg'])
-    if uploaded_file is not None:
-        grid_img = Image.open(uploaded_file).convert('L')
-        st.image(uploaded_file, caption="Uploaded Radiological Image", width=350)
-        arr = np.array(grid_img.resize((128, 128)))
-        volume_3d = np.stack([arr] * 5, axis=-1)
-        st.success("2D Image successfully converted to tensor stack.")
+    up = st.sidebar.file_uploader("Image", type=["png", "jpg", "jpeg"])
+    if up:
+        vol = np.array(Image.open(up).convert("L").resize((256, 256)), dtype=np.float32)[:, :, None]
+        name = up.name
 
-# --- COMMON PROCESSING & MASKED FUZZY SEGMENTATION ENGINE ---
-if volume_3d is not None:
-    st.markdown("---")
-    st.markdown("#### 🔬 Volumetric Slice Navigator & Fuzzy Segmentation Engine")
-    
-    if len(volume_3d.shape) == 3:
-        max_z = volume_3d.shape[2] - 1
-        z_idx = st.slider("Navigate Through Z-Axis Slices", 0, max_z, max_z // 2)
-        current_slice = volume_3d[:, :, z_idx]
-        if ground_truth_mask is not None:
-            gt_slice = ground_truth_mask[:, :, z_idx]
-        else:
-            gt_slice = None
-    else:
-        current_slice = volume_3d
-        z_idx = 0
-        gt_slice = None
+# ---------------------------------------------------------------- header
+st.markdown('<h1 class="title">Neuro Segmentation Workbench</h1>'
+            '<p class="sub">Masked Fuzzy C-Means tumour segmentation for 3D MRI, with FPC, Dice and IoU validation.</p>',
+            unsafe_allow_html=True)
+st.markdown('<div class="notice"><b>Research prototype.</b> Outputs are algorithmic estimates for study and '
+            'publication work. They are not a diagnosis and must not guide treatment.</div>', unsafe_allow_html=True)
+st.write("")
 
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.write(f"**Original Brain Slice (Frame: {z_idx})**")
-        fig1, ax1 = plt.subplots()
-        ax1.imshow(current_slice, cmap='gray', interpolation='bicubic')
-        ax1.axis('off')
-        st.pyplot(fig1)
-        
-    with col_b:
-        st.write("**Masked Fuzzy C-Means (Proposed Method)**")
-        flat = current_slice.flatten().astype(float)
-        norm = (flat - np.min(flat)) / (np.max(flat) - np.min(flat) + 1e-8)
-        
-        # 1. SKULL-STRIPPING: Background masking logic
-        brain_mask = norm > 0.12 
-        masked_data = norm[brain_mask].reshape(1, -1)
-        
-        try:
-            # FCM algorithm execution
-            cntr, u, _, _, _, _, fpc_score = fuzz.cluster.cmeans(
-                masked_data, c=4, m=2.0, error=0.005, maxiter=50, init=None
-            )
-            tumor_idx = np.argmax(cntr)
-            
-            # Reconstruction
-            full_membership = np.zeros_like(norm)
-            full_membership[brain_mask] = u[tumor_idx]
-            membership = full_membership.reshape(current_slice.shape)
-            
-            anomaly_pixels = np.sum(membership > 0.6)
-            total_brain_pixels = np.sum(brain_mask) 
-            if total_brain_pixels == 0: total_brain_pixels = 1
-            anomaly_percentage = (anomaly_pixels / total_brain_pixels) * 100
-            
-            # Binarize output mask for Dice/IoU
-            binary_prediction = (membership > 0.6).astype(np.uint8)
-            
-        except Exception:
-            membership = np.zeros(current_slice.shape)
-            binary_prediction = np.zeros(current_slice.shape)
-            anomaly_percentage = 0.0
-            fpc_score = 0.0
-            
-        fig2, ax2 = plt.subplots()
-        ax2.imshow(current_slice, cmap='gray', interpolation='bicubic')
-        masked_membership = np.ma.masked_where(membership < 0.1, membership)
-        ax2.imshow(masked_membership, cmap='jet', alpha=0.65, interpolation='bicubic')
-        ax2.axis('off')
-        st.pyplot(fig2)
-        
-        # --- PDF Report / Image Download Generation ---
+if vol is None:
+    st.info("Choose a scan in the sidebar to begin. The demo case needs no upload.")
+    st.stop()
+
+with st.spinner("Running masked FCM on the full volume..."):
+    res = segment(vol, clusters, fuzz_m, bg_thr)
+if res is None:
+    st.error("Too few brain voxels after background removal. Lower the background cut-off in the sidebar.")
+    st.stop()
+
+mem = res["membership"]
+pred = mem >= thr
+n_brain, n_tumor = int(res["brain"].sum()), int(pred.sum())
+burden = 100 * n_tumor / max(n_brain, 1)
+vol_cm3 = n_tumor * float(np.prod(spacing)) / 1000
+tone = "high" if burden > 30 else "warn" if burden > 10 else ""
+
+# ---------------------------------------------------------------- KPIs
+k = st.columns(4)
+with k[0]: kpi("Segmented volume", f"{vol_cm3:.2f} cm³", tone)
+with k[1]: kpi("Share of brain voxels", f"{burden:.2f}%", tone)
+with k[2]: kpi("Fuzzy partition coefficient", f"{res['fpc']:.4f}")
+with k[3]: kpi("Tensor shape", "×".join(map(str, vol.shape)))
+st.write("")
+
+# ---------------------------------------------------------------- tabs
+tab_view, tab_metrics, tab_report = st.tabs(["Slice viewer", "Validation", "Report"])
+
+with tab_view:
+    z = 0
+    if vol.shape[2] > 1:
+        z = st.slider("Axial slice", 0, vol.shape[2] - 1, vol.shape[2] // 2)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption(f"Original, slice {z}")
+        f1 = slice_figure(res["norm"][:, :, z])
+        st.pyplot(f1, use_container_width=True)
+    with c2:
+        st.caption(f"Masked FCM overlay, slice {z}")
+        f2 = slice_figure(res["norm"][:, :, z], mem[:, :, z], thr)
+        st.pyplot(f2, use_container_width=True)
         buf = io.BytesIO()
-        fig2.savefig(buf, format="png", bbox_inches='tight', pad_inches=0.1)
-        buf.seek(0)
-        st.download_button(
-            label="📥 Download Segmentation Overlay for Paper",
-            data=buf,
-            file_name=f"masked_fcm_result_slice_{z_idx}.png",
-            mime="image/png"
-        )
-        
-    # --- EVALUATION METRICS (DSC & IoU) ---
-    st.markdown("---")
-    st.markdown("#### 📐 Research Evaluation Metrics (For Publication)")
-    
-    if gt_slice is not None:
-        # Calculate Dice and IoU
-        intersection = np.sum(binary_prediction * gt_slice)
-        sum_masks = np.sum(binary_prediction) + np.sum(gt_slice)
-        
-        if sum_masks == 0:
-            dsc = 1.0
-            iou = 1.0
-        else:
-            dsc = (2. * intersection) / sum_masks
-            iou = intersection / (np.sum(binary_prediction) + np.sum(gt_slice) - intersection)
-            
-        st.success(f"**Calculated Scores vs. Ground Truth:**\n"
-                   f"- **Dice Similarity Coefficient (DSC):** `{dsc:.4f}`\n"
-                   f"- **Intersection over Union (IoU):** `{iou:.4f}`")
+        f2.savefig(buf, format="png", dpi=200, facecolor="black", bbox_inches="tight", pad_inches=0)
+        st.download_button("Download overlay (PNG)", buf.getvalue(), f"fcm_overlay_slice_{z}.png", "image/png")
+    plt.close("all")
+
+with tab_metrics:
+    if gt is not None:
+        d3, i3 = dice_iou(pred, gt.astype(bool))
+        ds, is_ = dice_iou(pred[:, :, z], gt[:, :, z].astype(bool))
+        m = st.columns(4)
+        with m[0]: kpi("Dice, whole volume", f"{d3:.4f}")
+        with m[1]: kpi("IoU, whole volume", f"{i3:.4f}")
+        with m[2]: kpi(f"Dice, slice {z}", f"{ds:.4f}")
+        with m[3]: kpi(f"IoU, slice {z}", f"{is_:.4f}")
     else:
-        st.info("Upload corresponding ground truth mask (or use Demo mode) to automatically calculate DSC and IoU.")
+        st.info("Add a ground-truth mask in the sidebar, or use the demo case, to compute Dice and IoU.")
+    st.write("")
+    st.markdown("**Cluster centres** (normalised intensity, ascending). The brightest centre is treated as tumour, "
+                "which suits FLAIR and T2 scans.")
+    st.bar_chart({f"C{i + 1}": float(v) for i, v in enumerate(res["centres"])})
 
-    # --- GRADUATE-LEVEL CLINICAL DIAGNOSTIC REPORT ---
-    st.markdown("---")
-    st.markdown("#### 📋 Clinical Diagnostic Report")
-    
-    estimated_volume_cc = round(anomaly_percentage * 4.5, 2)
-    if anomaly_percentage > 30.0:
-        severity = "High (Critical Mass)"
-        color = "🚨"
-    elif anomaly_percentage > 10.0:
-        severity = "Moderate"
-        color = "⚠️"
+with tab_report:
+    if burden > 30:
+        level = "Large segmented region"
+    elif burden > 10:
+        level = "Moderate segmented region"
+    elif burden > 2:
+        level = "Small segmented region"
     else:
-        severity = "Low"
-        color = "✅"
-
-    col_report1, col_report2 = st.columns(2)
-    
-    with col_report1:
-        st.error(f"{color} **Tumor Analytics:**\n"
-                 f"- **Estimated Volume:** {estimated_volume_cc} cm³\n"
-                 f"- **Severity Level:** {severity}\n"
-                 f"- **Algorithm:** Masked FCM (Clusters=4, m=2.0).")
-        
-        st.success("📐 **Mathematical Validation:**\n"
-                   f"- **Fuzzy Partition Coefficient (FPC):** `{fpc_score:.4f}`\n"
-                   f"- **Tensor Shape Reconstructed:** `{volume_3d.shape}`")
-
-    with col_report2:
-        st.warning("⚕️ **Clinical Recommendations:**\n"
-                   "- **Surgical:** Biopsy or Stereotactic Radiosurgery.\n"
-                   "- **Next Steps:** Full 3D contrast-enhanced MRI scan.")
-    # --- AI DIAGNOSTIC ANALYSIS GENERATOR (NEW FEATURE) ---
-    def generate_ai_analysis(anomaly_pct, fpc, volume_cc):
-        if anomaly_pct > 30.0:
-            return f"""**🚨 AI Pathology Analysis: Severe Anomaly Detected**
-- **Kya Masla Hai (Issue Description):** Brain tissue mein ek bohot bada (massive) abnormal cluster detect hua hai jiska volume takriban {volume_cc} cm³ hai. 
-- **Kaisa Masla Hai (Clinical Nature):** Yeh high-grade lesion (jaise Glioblastoma) ya bohot zyada swelling (Edema) ki alamat ho sakti hai. FCM algorithm ka score ({fpc:.4f}) batata hai ke is tumor ki boundaries ajeeb hain aur healthy tissue ke sath mix ho rahi hain. Iski wajah se aas-paas ke healthy dimaagh par pressure (mass effect) parh raha hoga. Foran neurosurgical intervention ki zaroorat hai."""
-            
-        elif anomaly_pct > 10.0:
-            return f"""**⚠️ AI Pathology Analysis: Moderate Focal Lesion**
-- **Kya Masla Hai (Issue Description):** Brain ke is hissay mein darmiyanay size ka ({volume_cc} cm³) abnormal tissue detect hua hai.
-- **Kaisa Masla Hai (Clinical Nature):** Yeh kisi localized tumor (jaise Meningioma ya Low-grade Glioma) ki shuruaat ho sakti hai. Is area ke pixels ki density normal brain matter se mukhtalif hai. FCM Score ({fpc:.4f}) show karta hai ke tumor abhi shuruati stage mein hai aur ek jagah jama hua hai. Doctor ko biopsy ya regular monitoring ka mashwara dena chahiye."""
-            
-        elif anomaly_pct > 2.0:
-            return f"""**🔍 AI Pathology Analysis: Mild / Micro Anomaly**
-- **Kya Masla Hai (Issue Description):** Ek bohot chota ({volume_cc} cm³) abnormal spot detect hua hai jo aam ankh se dekhna mushkil hai.
-- **Kaisa Masla Hai (Clinical Nature):** Yeh micro-lesion, chot (trauma), ya sirf scan ka artifact (machine noise) bhi ho sakta hai. Kyunke Fuzzy logic ne isay detect kiya hai, yeh early-stage pathology ho sakti hai. Isay confirm karne ke liye mazeed high-resolution scans ki zaroorat hai."""
-            
-        else:
-            return f"""**✅ AI Pathology Analysis: Normal / Clean**
-- **Kya Masla Hai (Issue Description):** Koi khas masla detect nahi hua. Anomaly volume bohot kam ({volume_cc} cm³) hai.
-- **Kaisa Masla Hai (Clinical Nature):** Jo minor pixels highlight hue hain woh shayad normal blood vessels ya MRI machine ke magnetic noise ki wajah se hain. Brain tissue ka structure bilkul healthy aur normal lag raha hai."""
-
-    # --- GRADUATE-LEVEL CLINICAL DIAGNOSTIC REPORT ---
-    st.markdown("---")
-    st.markdown("#### 📋 AI-Automated Clinical Diagnostic Report")
-    
-    estimated_volume_cc = round(anomaly_percentage * 4.5, 2)
-    ai_detailed_report = generate_ai_analysis(anomaly_percentage, fpc_score, estimated_volume_cc)
-    
-    # AI Report ko ek khubsurat box mein show karein
-    st.info(ai_detailed_report)
-
-    col_report1, col_report2 = st.columns(2)
-    
-    with col_report1:
-        st.success("📐 **Mathematical Validation:**\n"
-                   f"- **Fuzzy Partition Coefficient (FPC):** `{fpc_score:.4f}`\n"
-                   f"- **Anomaly Extent:** `{anomaly_percentage:.2f}%` of brain region\n"
-                   f"- **Tensor Shape Reconstructed:** `{volume_3d.shape}`")
-
-    with col_report2:
-        st.warning("⚕️ **Clinical Recommendations:**\n"
-                   "- **Surgical:** Biopsy or Stereotactic Radiosurgery.\n"
-                   "- **Next Steps:** Full 3D contrast-enhanced MRI scan.")
+        level = "Minimal or no segmented region"
+    report = (
+        f"NEURO SEGMENTATION REPORT (research use only)\n"
+        f"Scan: {name}\nShape: {vol.shape}   Voxel size (mm): {tuple(round(s, 2) for s in spacing)}\n"
+        f"Method: Masked FCM, c={clusters}, m={fuzz_m}, background cut-off={bg_thr}, threshold={thr}\n"
+        f"Segmented volume: {vol_cm3:.2f} cm3 ({burden:.2f}% of brain voxels)\n"
+        f"FPC: {res['fpc']:.4f}\nCategory: {level}\n"
+    )
+    st.markdown(f"**{level}.** About {burden:.1f}% of brain voxels ({vol_cm3:.2f} cm³) exceed the tumour "
+                f"membership threshold of {thr}.")
+    st.markdown(f"An FPC of {res['fpc']:.3f} describes how crisp the clustering is (1.0 means fully crisp). "
+                "It measures the algorithm, not the pathology.")
+    st.markdown("Any finding here needs confirmation by a radiologist on the original scans.")
+    st.code(report, language="text")
+    st.download_button("Download report (.txt)", report, "segmentation_report.txt")
