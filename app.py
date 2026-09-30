@@ -51,7 +51,10 @@ def load_nifti(data: bytes):
         path = f.name
     try:
         img = nib.load(path)
-        vol = np.asarray(img.get_fdata(dtype=np.float32))
+        if len(img.shape) == 4:  # multi-modal BraTS stack: load one channel only, not all of them
+            vol = np.asarray(img.dataobj[..., 0], dtype=np.float32)
+        else:
+            vol = np.asarray(img.get_fdata(dtype=np.float32))
         spacing = tuple(float(z) for z in img.header.get_zooms()[:3])
     finally:
         os.remove(path)
