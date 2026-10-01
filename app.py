@@ -137,21 +137,32 @@ if source == "Demo case":
     vol, gt, spacing = make_demo()
     name = "Synthetic demo"
 elif source.startswith("BraTS"):
-    up = st.sidebar.file_uploader("Scan volume", type=["nii", "gz"])
-    up_gt = st.sidebar.file_uploader("Ground-truth mask (optional)", type=["nii", "gz"])
-    if up:
-        vol, spacing = load_nifti(up.getvalue())
-        name = up.name
-        if up_gt:
-            gt = (load_nifti(up_gt.getvalue())[0] > 0).astype(np.uint8)
+    files = st.sidebar.file_uploader(
+        "Upload scan (.nii / .nii.gz). Optionally add the mask file too.", accept_multiple_files=True)
+    nii = [f for f in files if f.name.lower().endswith((".nii", ".nii.gz"))]
+    if files and not nii:
+        st.sidebar.error("No .nii or .nii.gz file found among the uploads.")
+    is_mask = lambda f: any(k in f.name.lower() for k in ("seg", "mask", "label", "gt"))
+    scans = [f for f in nii if not is_mask(f)] or nii[:1]
+    masks = [f for f in nii if is_mask(f) and f not in scans]
+    if scans:
+        vol, spacing = load_nifti(scans[0].getvalue())
+        name = scans[0].name
+        st.sidebar.caption(f"Scan: {name}")
+        if masks:
+            gt = (load_nifti(masks[0].getvalue())[0] > 0).astype(np.uint8)
+            st.sidebar.caption(f"Mask: {masks[0].name}")
             if gt.shape != vol.shape:
                 st.sidebar.error(f"Mask shape {gt.shape} does not match scan {vol.shape}.")
                 gt = None
 else:
-    up = st.sidebar.file_uploader("Image", type=["png", "jpg", "jpeg"])
+    up = st.sidebar.file_uploader("Image (png, jpg, webp, bmp, tiff)")
     if up:
-        vol = np.array(Image.open(up).convert("L").resize((256, 256)), dtype=np.float32)[:, :, None]
-        name = up.name
+        try:
+            vol = np.array(Image.open(up).convert("L").resize((256, 256)), dtype=np.float32)[:, :, None]
+            name = up.name
+        except Exception:
+            st.sidebar.error("This file could not be read as an image. Try PNG or JPG.")
 
 # ---------------------------------------------------------------- header
 st.markdown('<h1 class="title">Neuro Segmentation Workbench</h1>'
