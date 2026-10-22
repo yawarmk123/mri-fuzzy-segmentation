@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
-One-command BraTS evaluation for Kaggle (whole-tumour, FLAIR by default), with the user's
-COPRAS-Guided FCM as the proposed method.
+BraTS FLAIR evaluation: FCM baselines and COPRAS-FCM ablations.
 
-    !pip -q install nibabel
-    !git clone https://github.com/yawarmk123/mri-fuzzy-segmentation
-    # 1) development run (the cases you have already looked at)
-    !python mri-fuzzy-segmentation/kaggle_eval.py --n 100
-    # 2) FINAL run on cases you have never looked at, with all constants frozen
-    !python mri-fuzzy-segmentation/kaggle_eval.py --start 100 --n 300 --out-name results_test
+Run in Kaggle:
+  !python mri-fuzzy-segmentation/evaluate.py --n 100 --out-name results_dev
+  !python mri-fuzzy-segmentation/evaluate.py --start 100 --n 300 --out-name results_test
 
-Fairness rules built in
-  * Methods receive only (image, brain_mask, args): ground truth is never visible to them.
-  * The same connected-component clean-up is applied to EVERY method.
-  * Ablations show where the gain comes from: sfcm_thr (threshold alone) and copras_nothr (COPRAS alone).
-Resumable per (case, method): re-running skips finished work.
+IMPORTANT:
+- Development cases may be used for design decisions; held-out cases must not be
+  used to tune parameters.
+- This script does not guarantee COPRAS-FCM outperforms any baseline.
+- Existing output CSV is resumed only within the chosen output directory.
 """
 import argparse
 import json
-import os
-import shutil
-import tarfile
 import time
 from pathlib import Path
 
@@ -34,395 +27,474 @@ from scipy import ndimage as ndi
 from scipy.cluster.vq import kmeans2
 from scipy.stats import wilcoxon
 
-KEYS = {"flair": ("flair", "t2f"), "t2": ("t2w", "_t2.nii", "-t2.nii")}
-KAGGLEHUB_SLUG = "dschettler8845/brats-2021-task1"
-DIAG = []  # was the COPRAS-chosen cluster simply the brightest one?
+# FIX (Bug 5): removed useless "t2f" / "t2w" keys; kept only real BraTS substrings.
+MODALITY_KEYS = {
+    "flair": ("flair",),
+    "t2": ("_t2", "-t2"),
+}
+DIAGNOSTICS = []
+
+# FIX (Bug 22): single source of truth for FCM sample size, shared by fit and COPRAS.
+FCM_SAMPLE_SIZE = 30000
 
 
-# ------------------------------------------------------------------ maths
 def normalise(vol, brain):
-    lo, hi = np.percentile(vol[brain], [1, 99])
-    return np.clip((vol - lo) / (hi - lo + 1e-8), 0, 1).astype(np.float32)
+    vals = vol[brain]
+    # FIX (Bug 1): guard against <2 voxels so np.percentile never misbehaves.
+    if vals.size < 2:
+        return np.zeros_like(vol, dtype=np.float32)
+    lo, hi = np.percentile(vals, [1, 99])
+    if hi <= lo:
+        return np.zeros_like(vol, dtype=np.float32)
+    return np.clip((vol - lo) / (hi - lo), 0, 1).astype(np.float32)
 
 
-def _memberships(x, centres, m):
+def memberships(x, centres, m):
     d = np.abs(x[:, None] - centres[None, :]) + 1e-8
     inv = d ** (-2.0 / (m - 1.0))
-    return inv / inv.sum(axis=1, keepdims=True)
+    return inv / np.maximum(inv.sum(axis=1, keepdims=True), 1e-12)
 
 
-def _subsample(x, n, seed):
+def subsample(x, n, seed):
     if x.size <= n:
         return x
-    return x[np.random.default_rng(seed).integers(0, x.size, n)]
+    return x[np.random.default_rng(seed).choice(x.size, size=n, replace=False)]
 
 
-def fcm_fit(x, c, m, seed, iters=150, tol=1e-6, n_sample=30000):
-    s = _subsample(x, n_sample, seed)
-    cn = np.percentile(s, np.linspace(5, 95, c))
+def fcm_fit(x, c, m, seed, iters=150, tol=1e-6, n_sample=FCM_SAMPLE_SIZE):
+    """
+    FIX (Bug 22): returns (centres, sample) so callers can reuse the exact
+    sample that produced the centres. This removes the 30k-vs-40k mismatch
+    between fcm_fit and copras_mask.
+    """
+    sample = subsample(np.asarray(x), n_sample, seed)
+    centres = np.percentile(sample, np.linspace(5, 95, c))
     for _ in range(iters):
-        w = _memberships(s, cn, m) ** m
-        new = (w * s[:, None]).sum(0) / w.sum(0)
-        done = np.max(np.abs(new - cn)) < tol
-        cn = new
-        if done:
+        w = memberships(sample, centres, m) ** m
+        new = (w * sample[:, None]).sum(0) / np.maximum(w.sum(0), 1e-12)
+        converged = np.max(np.abs(new - centres)) < tol
+        centres = new
+        if converged:
             break
-    return np.sort(cn)
+    return np.sort(centres), sample
 
 
-def bright_cluster(x, centres, m, chunk=500_000, thr=0.0):
-    """Voxel belongs to the brightest cluster (and has membership >= thr there)."""
-    out = np.empty(x.size, dtype=bool)
-    last = len(centres) - 1
-    for i in range(0, x.size, chunk):
-        u = _memberships(x[i:i + chunk], centres, m)
-        out[i:i + chunk] = (u.argmax(1) == last) & (u[:, last] >= thr)
-    return out
+def brightest_mask(x, centres, m, threshold=0.0, chunk=500000):
+    result = np.zeros(x.size, dtype=bool)
+    k = int(np.argmax(centres))
+    for start in range(0, x.size, chunk):
+        u = memberships(x[start:start + chunk], centres, m)
+        result[start:start + chunk] = (
+            (u.argmax(axis=1) == k) & (u[:, k] >= threshold)
+        )
+    return result
 
 
-def otsu(x, bins=256):
-    h, e = np.histogram(x, bins=bins, range=(0, 1))
-    p = h / max(h.sum(), 1)
-    w = np.cumsum(p)
-    mu = np.cumsum(p * (e[:-1] + e[1:]) / 2)
-    return e[np.argmax((mu[-1] * w - mu) ** 2 / (w * (1 - w) + 1e-12)) + 1]
+def otsu_threshold(x, bins=256):
+    hist, edges = np.histogram(x, bins=bins, range=(0, 1))
+    prob = hist.astype(float) / max(hist.sum(), 1)
+    weight = np.cumsum(prob)
+    means = np.cumsum(prob * ((edges[:-1] + edges[1:]) / 2))
+    denom = weight * (1 - weight)
+    score = (means[-1] * weight - means) ** 2 / (denom + 1e-12)
+    score[(weight <= 0) | (weight >= 1)] = 0
+    idx = int(np.argmax(score))
+    # FIX (Bug 2): explicit guard against off-by-one at the last bin.
+    return edges[idx + 1] if idx + 1 < len(edges) else edges[-1]
 
 
 def postprocess(mask, keep_frac=0.15):
-    """Keep connected components >= keep_frac of the largest one. Applied to ALL methods."""
     if not mask.any():
         return mask
-    lab, n = ndi.label(mask)
-    if n <= 1:
+    labels, count = ndi.label(mask)
+    if count <= 1:
         return mask
-    sizes = ndi.sum(mask, lab, range(1, n + 1))
-    return np.isin(lab, np.where(sizes >= keep_frac * sizes.max())[0] + 1)
+    sizes = ndi.sum(mask, labels, range(1, count + 1))
+    keep = np.where(sizes >= keep_frac * sizes.max())[0] + 1
+    return np.isin(labels, keep)
 
 
-# ------------------------------------------------------------------ COPRAS (user's design)
-def copras_select_cluster(x, u_mat, centres):
-    """Criteria: intensity (+), sharpness (+), variance (-), volume penalty (-). Fixed weights."""
+def copras_select_cluster(x_sample, u_sample, centres):
+    """
+    Fixed-weight COPRAS decision score.
+    Criteria: intensity (+), mean membership (+), intensity SD (-),
+    distance of cluster fraction from target fraction (-).
+    This is not entropy weighting.
+    """
     c = len(centres)
-    labels = u_mat.argmax(axis=1)
-    valid = np.zeros(c, dtype=bool)
-    rows = []
+    labels = u_sample.argmax(axis=1)
+    rows, valid_ids = [], []
     for k in range(c):
-        mask = labels == k
-        if mask.sum() < 10:
+        chosen = labels == k
+        if chosen.sum() < 10:
             continue
-        valid[k] = True
-        frac = float(mask.mean())
-        rows.append([float(centres[k]) + 1e-6,
-                     float(u_mat[mask, k].mean()) + 1e-6,
-                     float(x[mask].std()) + 1e-4,
-                     abs(frac - 0.06) + (10.0 if (frac > 0.35 or frac < 0.002) else 0.001)])
-    U = np.full(c, -np.inf)
-    if not valid.any():
-        return int(np.argmax(centres)), U
-    X = np.array(rows, dtype=np.float64)
-    D = X / (X.sum(axis=0, keepdims=True) + 1e-12) * np.array([0.40, 0.20, 0.20, 0.20])
-    s_plus, s_minus = D[:, :2].sum(1), D[:, 2:].sum(1)
-    inv = 1.0 / (s_minus + 1e-12)
-    Q = s_plus + (s_minus.sum() * inv) / (inv.sum() + 1e-12)
-    U[valid] = (Q / (Q.max() + 1e-12)) * 100.0
-    return int(np.argmax(U)), U
+        frac = float(chosen.mean())
+        rows.append([
+            float(centres[k]) + 1e-6,
+            float(u_sample[chosen, k].mean()) + 1e-6,
+            float(x_sample[chosen].std()) + 1e-4,
+            abs(frac - 0.06) + (10.0 if (frac > 0.35 or frac < 0.002) else 0.001),
+        ])
+        valid_ids.append(k)
+
+    scores = np.full(c, -np.inf)
+    if not rows:
+        return int(np.argmax(centres)), scores
+
+    X = np.asarray(rows, dtype=np.float64)
+    weights = np.array([0.40, 0.20, 0.20, 0.20])
+    D = X / (X.sum(axis=0, keepdims=True) + 1e-12) * weights
+    benefit = D[:, :2].sum(axis=1)
+    cost = D[:, 2:].sum(axis=1)
+    inv_cost = 1.0 / (cost + 1e-12)
+    q = benefit + (cost.sum() * inv_cost) / (inv_cost.sum() + 1e-12)
+    scores[valid_ids] = q / (q.max() + 1e-12) * 100
+    return int(np.argmax(scores)), scores
 
 
-def _copras(vol, brain, a, thr, diag):
-    n = normalise(ndi.gaussian_filter(vol, a.sigma), brain)
-    x = n[brain].astype(np.float64)
-    cn = fcm_fit(x, a.c, a.m, a.seed)
-    u_s = _memberships(_subsample(x, 40000, a.seed), cn, a.m)
-    k, _ = copras_select_cluster(_subsample(x, 40000, a.seed), u_s, cn)
-    if diag:
-        DIAG.append(k == len(cn) - 1)
-    lab = np.empty(x.size, dtype=bool)
-    for i in range(0, x.size, 500_000):
-        u = _memberships(x[i:i + 500_000], cn, a.m)
-        lab[i:i + 500_000] = (u.argmax(1) == k) & (u[:, k] >= thr)
-    out = np.zeros(vol.shape, bool)
-    out[brain] = lab
-    return out
+def copras_mask(vol, brain, args, threshold, record_diagnostic=False):
+    smoothed = ndi.gaussian_filter(vol, args.sigma) if args.sigma > 0 else vol
+    norm = normalise(smoothed, brain)
+    x = norm[brain].astype(np.float64)
+    # FIX (Bug 22): reuse the SAME sample that fcm_fit used to produce centres.
+    centres, x_sample = fcm_fit(
+        x, args.c, args.m, args.seed, n_sample=FCM_SAMPLE_SIZE
+    )
+    u_sample = memberships(x_sample, centres, args.m)
+    selected, _ = copras_select_cluster(x_sample, u_sample, centres)
+
+    if record_diagnostic:
+        DIAGNOSTICS.append(selected == int(np.argmax(centres)))
+
+    result = np.zeros(vol.shape, dtype=bool)
+    labels = np.zeros(x.size, dtype=bool)
+    for start in range(0, x.size, 500000):
+        xx = x[start:start + 500000]
+        u = memberships(xx, centres, args.m)
+        labels[start:start + xx.size] = (
+            (u.argmax(axis=1) == selected) & (u[:, selected] >= threshold)
+        )
+    result[brain] = labels
+    return result
 
 
-def m_copras_fcm(vol, brain, a):
-    return _copras(vol, brain, a, a.thr, True)
+def masked_fcm(vol, brain, args, smooth=False, threshold=0.0):
+    source = ndi.gaussian_filter(vol, args.sigma) if smooth and args.sigma > 0 else vol
+    norm = normalise(source, brain)
+    x = norm[brain].astype(np.float64)
+    centres, _ = fcm_fit(x, args.c, args.m, args.seed)
+    result = np.zeros(vol.shape, dtype=bool)
+    result[brain] = brightest_mask(x, centres, args.m, threshold)
+    return result
 
 
-def m_copras_nothr(vol, brain, a):
-    return _copras(vol, brain, a, 0.0, False)
+def method_otsu(vol, brain, args):
+    norm = normalise(vol, brain)
+    return brain & (norm > otsu_threshold(norm[brain]))
 
 
-# ------------------------------------------------------------------ baselines / ablations
-def m_otsu(vol, brain, a):
-    n = normalise(vol, brain)
-    return brain & (n > otsu(n[brain]))
+def method_kmeans(vol, brain, args):
+    norm = normalise(vol, brain)
+    x = norm[brain].astype(np.float64)
+    sample = subsample(x, 30000, args.seed)
+    centres, _ = kmeans2(sample[:, None], args.c, minit="++", seed=args.seed)
+    centres = centres.ravel()
+    chosen_centre = int(np.argmax(centres))
+    result = np.zeros(vol.shape, dtype=bool)
+    labels = np.zeros(x.size, dtype=bool)
+    for start in range(0, x.size, 500000):
+        xx = x[start:start + 500000]
+        labels[start:start + xx.size] = (
+            np.abs(xx[:, None] - centres[None, :]).argmin(axis=1) == chosen_centre
+        )
+    result[brain] = labels
+    return result
 
 
-def m_kmeans(vol, brain, a):
-    x = normalise(vol, brain)[brain].astype(np.float64)
-    cent, _ = kmeans2(_subsample(x, 30000, a.seed)[:, None], a.c, minit="++", seed=a.seed)
-    cent = cent.ravel()
-    lab = np.empty(x.size, bool)
-    for i in range(0, x.size, 500_000):
-        lab[i:i + 500_000] = np.abs(x[i:i + 500_000, None] - cent[None, :]).argmin(1) == cent.argmax()
-    out = np.zeros(vol.shape, bool)
-    out[brain] = lab
-    return out
+def method_fcm_unmasked(vol, brain, args):
+    """
+    FIX (Bug 10): by design this method ignores `brain` so it can over-segment
+    into the background. Kept for ablation; documented explicitly.
+    """
+    norm = normalise(vol, brain).ravel().astype(np.float64)
+    centres, _ = fcm_fit(norm, args.c, args.m, args.seed)
+    return brightest_mask(norm, centres, args.m).reshape(vol.shape)
 
 
-def m_fcm_unmasked(vol, brain, a):
-    n = normalise(vol, brain).ravel().astype(np.float64)
-    return bright_cluster(n, fcm_fit(n, a.c, a.m, a.seed), a.m).reshape(vol.shape)
+def method_masked_fcm(vol, brain, args):
+    return masked_fcm(vol, brain, args)
 
 
-def _masked(vol, brain, a, thr=0.0):
-    x = normalise(vol, brain)[brain].astype(np.float64)
-    out = np.zeros(vol.shape, bool)
-    out[brain] = bright_cluster(x, fcm_fit(x, a.c, a.m, a.seed), a.m, thr=thr)
-    return out
+def method_sfcm(vol, brain, args):
+    return masked_fcm(vol, brain, args, smooth=True)
 
 
-def m_masked_fcm(vol, brain, a):
-    return _masked(vol, brain, a)
+def method_sfcm_thr(vol, brain, args):
+    return masked_fcm(vol, brain, args, smooth=True, threshold=args.thr)
 
 
-def m_sfcm(vol, brain, a):
-    return _masked(ndi.gaussian_filter(vol, a.sigma), brain, a)
+def method_copras_nothr(vol, brain, args):
+    return copras_mask(vol, brain, args, 0.0, False)
 
 
-def m_sfcm_thr(vol, brain, a):
-    """Ablation: sFCM + the same membership threshold as copras_fcm, WITHOUT COPRAS."""
-    return _masked(ndi.gaussian_filter(vol, a.sigma), brain, a, thr=a.thr)
+def method_copras_fcm(vol, brain, args):
+    return copras_mask(vol, brain, args, args.thr, True)
 
 
-METHODS = {"otsu": m_otsu, "kmeans": m_kmeans, "fcm_unmasked": m_fcm_unmasked,
-           "masked_fcm": m_masked_fcm, "sfcm": m_sfcm, "sfcm_thr": m_sfcm_thr,
-           "copras_nothr": m_copras_nothr, "copras_fcm": m_copras_fcm}
+METHODS = {
+    "otsu": method_otsu,
+    "kmeans": method_kmeans,
+    "fcm_unmasked": method_fcm_unmasked,
+    "masked_fcm": method_masked_fcm,
+    "sfcm": method_sfcm,
+    "sfcm_thr": method_sfcm_thr,
+    "copras_nothr": method_copras_nothr,
+    "copras_fcm": method_copras_fcm,
+}
 
 
-# ------------------------------------------------------------------ metrics
-def dice_iou(p, g):
-    s = p.sum() + g.sum()
-    if s == 0:
+def dice_iou(pred, truth):
+    total = pred.sum() + truth.sum()
+    if total == 0:
         return 1.0, 1.0
-    i = np.logical_and(p, g).sum()
-    return 2 * i / s, i / (s - i)
+    intersection = np.logical_and(pred, truth).sum()
+    return float(2 * intersection / total), float(intersection / (total - intersection))
 
 
-def hd95(p, g, spacing):
-    if not p.any() or not g.any():
+def hd95(pred, truth, spacing):
+    if not pred.any() or not truth.any():
         return np.nan
-    sp, sg = p ^ ndi.binary_erosion(p), g ^ ndi.binary_erosion(g)
-    d_g = ndi.distance_transform_edt(~sg, sampling=spacing)
-    d_p = ndi.distance_transform_edt(~sp, sampling=spacing)
-    return float(np.percentile(np.concatenate([d_g[sp], d_p[sg]]), 95))
+    pred_surface = pred ^ ndi.binary_erosion(pred)
+    truth_surface = truth ^ ndi.binary_erosion(truth)
+    d_truth = ndi.distance_transform_edt(~truth_surface, sampling=spacing)
+    d_pred = ndi.distance_transform_edt(~pred_surface, sampling=spacing)
+    distances = np.concatenate([d_truth[pred_surface], d_pred[truth_surface]])
+    return float(np.percentile(distances, 95)) if distances.size else np.nan
 
 
-def holm(p):
-    order = np.argsort(p)
-    adj, run = np.empty(len(p)), 0.0
-    for r, i in enumerate(order):
-        run = max(run, (len(p) - r) * p[i])
-        adj[i] = min(1.0, run)
-    return adj
+def holm_adjust(p_values):
+    p_values = np.asarray(p_values, dtype=float)
+    order = np.argsort(p_values)
+    adjusted = np.empty(len(p_values), dtype=float)
+    running = 0.0
+    for rank, idx in enumerate(order):
+        running = max(running, (len(p_values) - rank) * p_values[idx])
+        adjusted[idx] = min(1.0, running)
+    return adjusted
 
 
-# ------------------------------------------------------------------ data discovery
 def find_cases(root, modality):
-    keys, root, cases = KEYS[modality], Path(root), []
-    for d in sorted(p for p in root.rglob("*") if p.is_dir()):
-        files = list(d.glob("*.nii")) + list(d.glob("*.nii.gz"))
-        img = [f for f in files if "seg" not in f.name.lower() and any(k in f.name.lower() for k in keys)]
-        seg = [f for f in files if "seg" in f.name.lower()]
-        if img and seg:
-            cases.append((str(d.relative_to(root)), img[0], seg[0]))
-    return cases
+    keys = MODALITY_KEYS[modality]
+    root = Path(root)
+    cases = []
+    for directory in sorted(p for p in root.rglob("*") if p.is_dir()):
+        files = list(directory.glob("*.nii")) + list(directory.glob("*.nii.gz"))
+        images = [f for f in files if "seg" not in f.name.lower()
+                  and any(k in f.name.lower() for k in keys)]
+        segs = [f for f in files if "seg" in f.name.lower()]
+        if images and segs:
+            cases.append((str(directory.relative_to(root)), images[0], segs[0]))
+    unique = {}
+    for case in cases:
+        unique[case[0]] = case
+    return [unique[k] for k in sorted(unique)]
 
 
-def extract_from_tars(tars, out, n, modality):
-    keys = KEYS[modality]
-    out.mkdir(parents=True, exist_ok=True)
-    big = [t for t in tars if "training" in t.lower()] or tars
-    seen = []
-    for tpath in big:
-        print(f"Streaming {tpath} ...")
-        with tarfile.open(tpath, "r|") as t:
-            for m in t:
-                low = m.name.lower()
-                if not m.isfile() or not low.endswith((".nii", ".nii.gz")):
-                    continue
-                if not ("seg" in low or any(k in low for k in keys)):
-                    continue
-                case = os.path.basename(os.path.dirname(m.name)) or Path(m.name).stem
-                if case not in seen:
-                    if n and len(seen) >= n:
-                        break
-                    seen.append(case)
-                    if len(seen) % 25 == 0:
-                        print(f"  {len(seen)} cases extracted")
-                try:
-                    t.extract(m, out, filter="data")
-                except TypeError:
-                    t.extract(m, out)
-        if n and len(seen) >= n:
-            break
+def bootstrap_ci(values, reps=2000, seed=12345):
+    """
+    FIX (Bug 14): fresh RNG per call so each method's CI is independent
+    and reproducible regardless of call order.
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    means = np.array([
+        rng.choice(values, size=values.size, replace=True).mean()
+        for _ in range(reps)
+    ])
+    return np.percentile(means, [2.5, 97.5])
 
 
-def locate_data(a, work):
-    need = a.start + a.n if a.n else 0
-    src = Path(a.input)
-    cases = find_cases(src, a.modality)
-    if cases:
-        print(f"Found {len(cases)} loose cases under {src}")
-        return cases
-    tars = [str(p) for p in src.rglob("*.tar")]
-    if not tars and a.allow_download:
-        try:
-            import kagglehub
-            print(f"No data attached; trying kagglehub download of {KAGGLEHUB_SLUG} ...")
-            src = Path(kagglehub.dataset_download(KAGGLEHUB_SLUG))
-            cases = find_cases(src, a.modality)
-            if cases:
-                return cases
-            tars = [str(p) for p in src.rglob("*.tar")]
-        except Exception as e:
-            print("kagglehub download failed:", repr(e)[:200])
-    if not tars:
-        raise SystemExit("\nNo BraTS data found. Attach 'BRaTS 2021 Task 1 Dataset' via Add Input > Datasets.")
-    out = work / "brats_extracted"
-    have = find_cases(out, a.modality) if out.exists() else []
-    if need and len(have) >= need:
-        print(f"Reusing {len(have)} already-extracted cases in {out}")
-        return have
-    extract_from_tars(tars, out, need, a.modality)
-    return find_cases(out, a.modality)
-
-
-# ------------------------------------------------------------------ main
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="/kaggle/input")
-    ap.add_argument("--work", default="/kaggle/working")
-    ap.add_argument("--n", type=int, default=100, help="number of cases; 0 = all")
-    ap.add_argument("--start", type=int, default=0, help="skip the first START cases (held-out split)")
-    ap.add_argument("--out-name", default="results")
-    ap.add_argument("--modality", default="flair", choices=list(KEYS))
-    ap.add_argument("--c", type=int, default=4)
-    ap.add_argument("--m", type=float, default=2.0)
-    ap.add_argument("--sigma", type=float, default=1.0)
-    ap.add_argument("--thr", type=float, default=0.55, help="membership threshold (copras_fcm, sfcm_thr)")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--no-postproc", action="store_true")
-    ap.add_argument("--proposed", default="copras_fcm")
-    ap.add_argument("--no-download", dest="allow_download", action="store_false")
-    a, _ = ap.parse_known_args()
-    if a.m <= 1.0:
-        raise SystemExit("--m must be > 1.")
-    if a.proposed not in METHODS:
-        raise SystemExit(f"--proposed must be one of {list(METHODS)}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default="/kaggle/input")
+    parser.add_argument("--work", default="/kaggle/working")
+    parser.add_argument("--n", type=int, default=100, help="cases; 0 means all available")
+    parser.add_argument("--start", type=int, default=0, help="start index in sorted case list")
+    parser.add_argument("--out-name", default="results")
+    parser.add_argument("--modality", choices=list(MODALITY_KEYS), default="flair")
+    parser.add_argument("--c", type=int, default=4)
+    parser.add_argument("--m", type=float, default=2.0)
+    parser.add_argument("--sigma", type=float, default=1.0)
+    parser.add_argument("--thr", type=float, default=0.55)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--keep-frac", type=float, default=0.15)
+    parser.add_argument("--no-postproc", action="store_true")
+    args = parser.parse_args()
 
-    work = Path(a.work)
-    out = work / a.out_name
+    if args.m <= 1:
+        parser.error("--m must be greater than 1")
+    if args.c < 2:
+        parser.error("--c must be at least 2")
+    if not 0 <= args.thr <= 1:
+        parser.error("--thr must be between 0 and 1")
+    if not 0 <= args.keep_frac <= 1:
+        parser.error("--keep-frac must be between 0 and 1")
+
+    work = Path(args.work)
+    out = work / args.out_name
     out.mkdir(parents=True, exist_ok=True)
-    cases = locate_data(a, work)
-    cases = cases[a.start:a.start + a.n] if a.n else cases[a.start:]
+    cases = find_cases(args.input, args.modality)
     if not cases:
-        raise SystemExit("No complete cases (modality + seg) in the requested range.")
-    print(f"\nCases {a.start}..{a.start + len(cases) - 1}: first {cases[0][0]}, last {cases[-1][0]}")
-    print(f"Evaluating {len(cases)} cases x {len(METHODS)} methods: {', '.join(METHODS)}\n")
+        cases = find_cases(work / "brats_extracted", args.modality)
+    if not cases:
+        raise SystemExit("No complete cases found. Attach the BraTS dataset and check modality filenames.")
 
-    csv = out / "per_case.csv"
-    rows = pd.read_csv(csv).to_dict("records") if csv.exists() else []
+    selected_cases = cases[args.start:args.start + args.n] if args.n else cases[args.start:]
+    if not selected_cases:
+        raise SystemExit(f"No cases in requested range: start={args.start}, n={args.n}")
+
+    print(f"Available complete cases: {len(cases)}")
+    print(f"Selected indices: {args.start}..{args.start + len(selected_cases) - 1}")
+    print(f"First: {selected_cases[0][0]} | Last: {selected_cases[-1][0]}")
+    print(f"Evaluating {len(selected_cases)} cases x {len(METHODS)} methods: {', '.join(METHODS)}")
+
+    csv_path = out / "per_case.csv"
+    settings_path = out / "run_info.json"
+    settings = vars(args).copy()
+    settings["methods"] = list(METHODS)
+    if csv_path.exists() and settings_path.exists():
+        old = json.loads(settings_path.read_text())
+        if old.get("settings") != settings:
+            raise SystemExit(
+                f"Output folder {out} has results from different settings. "
+                "Use a new --out-name to avoid mixing results."
+            )
+        rows = pd.read_csv(csv_path).to_dict("records")
+    elif csv_path.exists() and not settings_path.exists():
+        raise SystemExit(
+            f"{csv_path} exists without run_info.json. Use a new --out-name to avoid mixing results."
+        )
+    else:
+        rows = []
+
     done = {(r["case"], r["method"]) for r in rows}
+    # FIX (Bug 8/23): count only cases skipped in THIS run; resume runs report honestly.
     skipped = 0
-    for k, (cid, f_img, f_seg) in enumerate(cases, 1):
-        todo = [m for m in METHODS if (cid, m) not in done]
+    processed_now = 0
+    for idx, (case_id, image_path, seg_path) in enumerate(selected_cases, 1):
+        todo = [name for name in METHODS if (case_id, name) not in done]
         if not todo:
+            print(f"[{idx}/{len(selected_cases)}] {case_id}: already complete")
             continue
-        t0 = time.time()
-        img = nib.load(str(f_img))
-        vol = np.asarray(img.get_fdata(dtype=np.float32))
-        gt = np.asarray(nib.load(str(f_seg)).dataobj) > 0
-        sp = tuple(float(z) for z in img.header.get_zooms()[:3])
-        brain = vol > 0
-        if not gt.any() or brain.sum() < 1000 or gt.shape != vol.shape:
+        start_time = time.time()
+        image = nib.load(str(image_path))
+        vol = np.asarray(image.get_fdata(dtype=np.float32))
+        truth = np.asarray(nib.load(str(seg_path)).dataobj) > 0
+        spacing = tuple(float(v) for v in image.header.get_zooms()[:3])
+        brain = np.isfinite(vol) & (vol > 0)
+
+        if truth.shape != vol.shape or not truth.any() or brain.sum() < 1000:
             skipped += 1
-            print(f"[{k}/{len(cases)}] {cid}: skipped (empty/mismatched mask or brain)")
+            print(f"[{idx}/{len(selected_cases)}] {case_id}: skipped (invalid image/label)")
             continue
+
         for name in todo:
-            pred = METHODS[name](vol, brain, a)  # ground truth is NOT passed in
-            if not a.no_postproc:
-                pred = postprocess(pred)
-            d, i = dice_iou(pred, gt)
-            rows.append(dict(case=cid, method=name, dice=d, iou=i, hd95_mm=hd95(pred, gt, sp),
-                             pred_cm3=pred.sum() * np.prod(sp) / 1000, gt_cm3=gt.sum() * np.prod(sp) / 1000,
-                             vox_x=sp[0], vox_y=sp[1], vox_z=sp[2]))
-        pd.DataFrame(rows).to_csv(csv, index=False)
-        print(f"[{k}/{len(cases)}] {cid}: {time.time() - t0:.1f}s")
+            pred = METHODS[name](vol, brain, args)
+            if not args.no_postproc:
+                pred = postprocess(pred, args.keep_frac)
+            dice, iou = dice_iou(pred, truth)
+            rows.append({
+                "case": case_id, "method": name, "dice": dice, "iou": iou,
+                "hd95_mm": hd95(pred, truth, spacing),
+                "pred_cm3": float(pred.sum() * np.prod(spacing) / 1000),
+                "gt_cm3": float(truth.sum() * np.prod(spacing) / 1000),
+                "vox_x": spacing[0], "vox_y": spacing[1], "vox_z": spacing[2],
+            })
+        processed_now += 1
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        settings_path.write_text(json.dumps({
+            "settings": settings, "n_selected": len(selected_cases),
+            "start_index": args.start, "case_ids": [c[0] for c in selected_cases],
+        }, indent=2))
+        print(f"[{idx}/{len(selected_cases)}] {case_id}: {time.time() - start_time:.1f}s")
 
     df = pd.DataFrame(rows)
-    df = df[df.case.isin({c[0] for c in cases})]
-    piv = df.pivot(index="case", columns="method", values="dice")
-    names = list(METHODS)
-    others = [m for m in names if m != a.proposed]
-    pv = [wilcoxon(piv[a.proposed], piv[o]).pvalue if (piv[a.proposed] - piv[o]).abs().sum() > 0 else 1.0
-          for o in others]
-    padj = dict(zip(others, holm(np.array(pv))))
-    rng = np.random.default_rng(0)
+    df = df[df["case"].isin({c[0] for c in selected_cases})].copy()
+    if df.empty:
+        raise SystemExit("No valid evaluation rows were produced.")
+    pivot = df.pivot_table(index="case", columns="method", values="dice", aggfunc="first")
+    method_names = list(METHODS)
+    if "copras_fcm" not in pivot.columns:
+        raise SystemExit("No copras_fcm results found in this output.")
 
-    def ci(v):
-        v = v.dropna().to_numpy()
-        return np.percentile([rng.choice(v, v.size).mean() for _ in range(2000)], [2.5, 97.5])
+    comparisons, p_values = [], []
+    for name in method_names:
+        if name == "copras_fcm" or name not in pivot.columns:
+            continue
+        pair = pivot[["copras_fcm", name]].dropna()
+        diff = pair["copras_fcm"] - pair[name]
+        p = float(wilcoxon(diff).pvalue) if len(diff) and np.any(np.abs(diff) > 0) else 1.0
+        comparisons.append(name)
+        p_values.append(p)
+    adjusted = holm_adjust(p_values) if p_values else []
+    adjusted_map = dict(zip(comparisons, adjusted))
 
-    lines = ["| Method | Dice mean ± SD | Dice 95% CI | proposed − method (Dice) | IoU | HD95 (mm) | p (Holm) |",
-             "|---|---|---|---|---|---|---|"]
-    for name in names:
-        s = df[df.method == name]
-        lo, hi = ci(s.dice)
-        delta = "-" if name == a.proposed else f"{(piv[a.proposed] - piv[name]).mean():+.4f}"
-        p = "reference" if name == a.proposed else f"{padj[name]:.4g}"
-        lines.append(f"| {name} | {s.dice.mean():.4f} ± {s.dice.std():.4f} | [{lo:.3f}, {hi:.3f}] | {delta} | "
-                     f"{s.iou.mean():.4f} ± {s.iou.std():.4f} | {s.hd95_mm.mean():.2f} ± {s.hd95_mm.std():.2f} "
-                     f"(NaN {int(s.hd95_mm.isna().sum())}) | {p} |")
-    bf = f"COPRAS picked the brightest cluster in {np.mean(DIAG):.1%} of cases this run\n" if DIAG else ""
-    summary = ("\n".join(lines) + f"\n\nN = {piv.shape[0]} cases, modality = {a.modality}, proposed = {a.proposed}, "
-               f"post-processing = {'off' if a.no_postproc else 'on, all methods'}\n" + bf)
+    lines = [
+        "| Method | Dice mean ± SD | Dice 95% bootstrap CI | Δ Dice vs COPRAS-FCM | IoU mean | HD95 mm mean (NaN count) | p (Holm) |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in method_names:
+        subset = df[df.method == name]
+        if subset.empty:
+            continue
+        lo, hi = bootstrap_ci(subset.dice)
+        delta = "-" if name == "copras_fcm" else (
+            f"{(pivot['copras_fcm'] - pivot[name]).mean():+.4f}" if name in pivot.columns else "NA"
+        )
+        p_label = "reference" if name == "copras_fcm" else (
+            f"{adjusted_map[name]:.4g}" if name in adjusted_map else "NA"
+        )
+        lines.append(
+            f"| {name} | {subset.dice.mean():.4f} ± {subset.dice.std():.4f} "
+            f"| [{lo:.3f}, {hi:.3f}] | {delta} | {subset.iou.mean():.4f} "
+            f"| {subset.hd95_mm.mean():.2f} ({int(subset.hd95_mm.isna().sum())}) | {p_label} |"
+        )
+
+    diagnostic = (
+        f"COPRAS selected the brightest cluster in {np.mean(DIAGNOSTICS):.1%} "
+        f"of copras_fcm cases computed in this run ({len(DIAGNOSTICS)} cases)."
+        if DIAGNOSTICS else "COPRAS cluster-selection diagnostic unavailable for this run."
+    )
+    summary = "\n".join(lines) + (
+        f"\n\nValid cases: {pivot.shape[0]}; skipped in this run: {skipped}; "
+        f"processed in this run: {processed_now}; modality: {args.modality}; "
+        f"post-processing: {'off' if args.no_postproc else 'on for all methods'}.\n\n"
+        + diagnostic + "\n\n"
+        "Method note: COPRAS uses fixed weights [0.40, 0.20, 0.20, 0.20], not entropy-derived weights. "
+        "The target cluster fraction (0.06), penalty bounds, threshold, smoothing sigma, and component "
+        "retention fraction are design choices and must be fixed using development data only."
+    )
     (out / "summary.md").write_text(summary)
     print("\n" + summary)
 
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.boxplot([piv[m].dropna() for m in names], tick_labels=names, showfliers=True)
+    available = [m for m in method_names if m in pivot.columns]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.boxplot([pivot[m].dropna().to_numpy() for m in available], tick_labels=available)
     ax.set_ylabel("Dice (whole tumour)")
     ax.set_ylim(0, 1.02)
     ax.tick_params(axis="x", rotation=30)
-    ax.grid(axis="y", ls="--", alpha=0.4)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
     fig.tight_layout()
     fig.savefig(out / "dice_boxplot.png", dpi=200)
+    plt.close(fig)
 
-    print("=" * 60 + "\nAUDIT (read before trusting any number)\n" + "=" * 60)
-    first = df[df.method == names[0]]
-    print(f"Cases evaluated: {piv.shape[0]}   skipped: {skipped}")
-    print(f"Voxel sizes (mm): {sorted({(round(r.vox_x, 2), round(r.vox_y, 2), round(r.vox_z, 2)) for r in first.itertuples()})}")
-    print(f"Ground-truth tumour cm3: median {first.gt_cm3.median():.1f}, range {first.gt_cm3.min():.1f} to {first.gt_cm3.max():.1f}")
-    print("Ground truth access: methods are called as f(vol, brain, args); the mask is never passed in.")
-    dup = [(x, y) for i, x in enumerate(names) for y in names[i + 1:] if np.allclose(piv[x], piv[y], atol=1e-12)]
-    print("Identical-score method pairs:", dup or "none")
-    for m in names:
-        if piv[m].mean() > 0.95:
-            print(f"WARNING: {m} mean Dice {piv[m].mean():.3f} is far above published whole-tumour results; re-check.")
-    if piv.shape[0] < 100:
-        print(f"WARNING: only {piv.shape[0]} cases; use at least 100 (ideally several hundred) for a paper.")
-    print("REMINDER: weights (0.4/0.2/0.2/0.2), target fraction 0.06, thr, keep_frac and sigma are hand-set. "
-          "If you chose them after seeing results on these cases, report only on a held-out range (--start).")
-    (out / "run_info.json").write_text(json.dumps(dict(args=vars(a), n_cases=int(piv.shape[0])), indent=2))
-    shutil.make_archive(str(work / f"{a.out_name}_bundle"), "zip", out)
-    print(f"\nSaved: {out}  and  {work / (a.out_name + '_bundle.zip')}")
-    try:
-        from IPython.display import FileLink, display
-        display(FileLink(str(work / f"{a.out_name}_bundle.zip")))
-    except Exception:
-        pass
+    print(f"\nSaved results to: {out}")
+    print(f"CSV: {csv_path}")
+    print(f"Summary: {out / 'summary.md'}")
+    print(f"Plot: {out / 'dice_boxplot.png'}")
 
 
 if __name__ == "__main__":
